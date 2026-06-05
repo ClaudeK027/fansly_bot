@@ -1,0 +1,95 @@
+# config.yaml
+# Configuration fonctionnelle. Les secrets vont dans .env, jamais ici.
+
+paths:
+  media_folder: "data/Medias"
+  caption_folder: "data/Captions"
+  published_subfolder: "_published"   # sous-dossier ou les medias sont deplaces apres upload
+  state_db: "data/state.db"
+  logs_dir: "data/logs"
+  artifacts_dir: "data/artifacts"
+
+browser:
+  user_data_dir: "data/browser_profile"
+  headless: true
+  viewport_width: 1280
+  viewport_height: 800
+  locale: "en-US"
+  timezone: "Europe/Paris"
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+  navigation_timeout_ms: 30000
+  default_action_timeout_ms: 15000
+
+auth:
+  base_url: "https://fansly.com"
+  home_path: "/home"
+  # Timeout (s) accorde a l'humain pour resoudre 2FA / captcha lors du setup-auth
+  interactive_login_timeout_s: 600
+  # Verification periodique de la session pendant que le bot tourne (minutes)
+  session_check_interval_minutes: 60
+
+humanizer:
+  # Distribution log-normale : delai = exp(mu + sigma*N(0,1)), clampe.
+  short_pause:
+    median_s: 1.2
+    sigma: 0.4
+    min_s: 0.3
+    max_s: 5.0
+  long_pause:
+    median_s: 8.0
+    sigma: 0.6
+    min_s: 2.0
+    max_s: 60.0
+  typing:
+    per_char_ms_median: 90
+    per_char_ms_sigma: 0.35
+    per_char_ms_min: 30
+    per_char_ms_max: 280
+    micro_pause_probability: 0.08    # 8% des caracteres declenchent une mini pause
+    micro_pause_ms_min: 200
+    micro_pause_ms_max: 900
+
+publishing:
+  enabled: true
+  # ⚠️ TEMPORAIRE pour les tests : fenetre 24h. Remettre ["08:00", "23:00"] en production.
+  daily_window_local: ["00:00", "23:59"]
+  # ⚠️ Valeurs TEMPORAIRES pour le test (publication dans ~10-30 sec).
+  # En production : median=90, sigma=0.5, min=15, max=360 (en minutes).
+  interval_minutes_median: 0.2
+  interval_minutes_sigma: 0.3
+  interval_minutes_min: 0.1
+  interval_minutes_max: 1.0
+  media_extensions: [".mp4", ".avi", ".mov", ".mkv", ".jpg", ".jpeg", ".png", ".webm"]
+
+purge:
+  enabled: true
+  # Valeurs de PRODUCTION (a ajuster selon tes vrais mots-cles a purger)
+  # Valeurs de PRODUCTION (a personnaliser selon tes vrais besoins)
+  age_threshold_days: 30
+  keywords: ["promo"]
+  keyword_match_mode: "any"
+  daily_window_local: ["10:00", "16:00"]
+  max_deletions_per_run: 20
+  scroll_safety_cap: 500
+  dry_run: true                        # ⚠️ Sécurité : par défaut on observe, on ne supprime pas
+  # Profil Fansly cible : configurer via la variable d'environnement
+  # FANSLY_PROFILE_SLUG dans .env (gitignored). Laisser vide ici pour
+  # permettre la lecture depuis l'env. Override possible en mettant une
+  # valeur explicite (utile en dev pour cibler temporairement un autre profil).
+  profile_path: ""
+
+retry:
+  attempts: 3
+  initial_wait_s: 1.5
+  max_wait_s: 30.0
+
+logging:
+  level: "INFO"
+  json_to_file: true
+  pretty_to_console: true
+  rotate_max_bytes: 10485760
+  rotate_backup_count: 5
+
+dev:
+  dummy_job_enabled: false             # desactive en 3.2 : on a des vrais jobs maintenant
+  dummy_job_interval_s: 10

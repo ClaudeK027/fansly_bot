@@ -1,0 +1,45 @@
+# pyproject.toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fansly-bot"
+version = "2.0.0"
+description = "Bot Fansly V2 — automatisation furtive, orchestrée et résiliente."
+requires-python = ">=3.11"
+authors = [{ name = "fansly-bot" }]
+dependencies = [
+    "playwright>=1.47.0",
+    "playwright-stealth>=2.0.0",
+    "structlog>=24.1.0",
+    "pendulum>=3.0.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.4.0",
+    "pyyaml>=6.0.1",
+    "watchdog>=4.0.0",
+    "tenacity>=8.2.3",
+    "streamlit>=1.30.0",
+    "ruamel.yaml>=0.18.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+fansly-bot = "fansly_bot.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fansly_bot", "src/fansly_dashboard"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,72 @@
+# Deploiement Docker Compose pour le bot Fansly.
+#
+# Un seul service : container monolithique qui contient le worker + le
+# dashboard Streamlit. Pour la justification de ce choix (vs 2 containers),
+# voir docs/VPS_DEPLOY.md.
+#
+# Usage :
+#   docker compose up -d        # demarre en background
+#   docker compose logs -f      # suit les logs en temps reel
+#   docker compose restart      # restart container
+#   docker compose down         # stoppe et supprime le container
+#   docker compose build        # rebuild apres modif du code
+#   docker compose up -d --build  # rebuild + restart
+
+services:
+  fansly-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fansly-bot:latest
+    container_name: fansly-bot
+
+    # Restart automatique apres un crash, un reboot du VPS, ou un kill OOM.
+    # `unless-stopped` : ne relance PAS si on a explicitement fait
+    # `docker compose stop` — utile pour les maintenances.
+    restart: unless-stopped
+
+    # Credentials Fansly (FANSLY_USERNAME, FANSLY_PASSWORD) charges depuis
+    # /opt/fansly-bot/.env sur le VPS. Voir docs/VPS_DEPLOY.md pour le format.
+    env_file:
+      - .env
+
+    # Override de AUTOSTART_WORKER si besoin (defaut true via entrypoint).
+    # Decommente pour desactiver l autostart :
+    # environment:
+    #   AUTOSTART_WORKER: "false"
+
+    # Bind mounts : tout l etat persistant vit dans ./data du host.
+    # Backup facile : rsync ./data depuis le VPS.
+    # config.yaml en lecture seule : le code applicatif ne le modifie pas.
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+
+    # Streamlit uniquement accessible sur 127.0.0.1 du VPS (pas d exposition
+    # publique). Acces via tunnel SSH depuis le poste local :
+    #   ssh -L 8501:localhost:8501 user@vps
+    # puis http://localhost:8501 dans le navigateur local.
+    ports:
+      - "127.0.0.1:8501:8501"
+
+    # Chromium a besoin d un /dev/shm assez grand pour eviter les crashes
+    # "Out of memory" sur les pages lourdes (composer Fansly avec medias).
+    # Defaut Docker : 64 Mo. On passe a 1 Go.
+    shm_size: 1gb
+
+    # tini comme PID 1 — reape les zombies si on a un kill brutal (cas du
+    # bouton Forcer dans l UI qui SIGKILL le worker).
+    init: true
+
+    # Limite memoire raisonnable. Chromium + 2 publications en parallele
+    # consomment ~1.5-2 Go. 3 Go de cap protege contre un leak runaway.
+    # Ajuste si ton VPS a moins de RAM.
+    mem_limit: 3g
+
+    # Logs Docker : on garde les 10 derniers fichiers de 50 Mo pour eviter
+    # de saturer le disque sur un VPS qui tourne des semaines.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"

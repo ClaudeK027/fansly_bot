@@ -1,0 +1,62 @@
+# .gitignore
+
+# Secrets et donnees runtime
+.env
+.env.backup
+.env.*
+!.env.example
+data/browser_profile/
+data/logs/
+# SQLite en mode WAL genere state.db, state.db-wal, state.db-shm — un glob
+# unique couvre tous les fichiers compagnons. Ces fichiers contiennent
+# les captions et l'historique des publications en clair.
+data/state.db*
+data/Medias/*
+data/Captions/*
+data/.DS_Store
+!data/Medias/.gitkeep
+!data/Captions/.gitkeep
+# Fichiers temporaires d'ecriture atomique des lots de legendes
+data/Captions/.*.json.tmp
+# Worker runtime files (pid, lock, timestamp, état)
+data/worker.pid
+data/worker.pid.lock
+data/worker.started_at
+data/worker.state
+
+# Artefacts de diagnostic
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg
+.eggs/
+.coverage
+htmlcov/
+.tox/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Code legacy v1 (avant refonte) — gardé localement pour référence,
+# pas exposé publiquement
+fansly version 1.0.py
+donnees.txt
+
+# Outils internes (config Claude Code)
+.claude/

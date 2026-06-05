@@ -1,0 +1,52 @@
+# Exclus du contexte de build Docker — accelere les builds et evite
+# d embarquer secrets / donnees runtime / venv local.
+
+# Environnement Python local
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+
+# Donnees runtime — montees via volume Docker, pas embarquees dans l image
+data/
+
+# Secrets — places sur le VPS via .env separe, jamais dans l image
+.env
+.env.*
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation et tests : pas necessaires dans le container de prod
+docs/
+tests/
+
+# Scripts de dev/investigation
+scripts/
+
+# Code legacy v1 — non utilise par la v2
+fansly\ version\ 1.0.py
+
+# Editeurs et OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# Docker meta-fichiers : Dockerfile + compose sont utilises par Docker lui-meme,
+# pas besoin qu ils soient dans le contexte de build (ils sont lus avant).
+# ATTENTION : on ne peut PAS exclure docker/ car entrypoint.sh est referenced
+# par `COPY docker/entrypoint.sh` dans le Dockerfile.
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Markdown a la racine sauf si necessaire
+*.md
+!README.md
