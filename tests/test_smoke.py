@@ -308,32 +308,6 @@ class TestCleanupOrphanActiveBatch(_TmpStateMixin, unittest.TestCase):
         self.assertIsNone(self.store.get_active_batch())
 
 
-class TestResolveOrphanInFlight(_TmpStateMixin, unittest.TestCase):
-    def test_resolves_and_clears(self):
-        from fansly_bot.infra.state import StateStore
-        from fansly_bot.worker import Worker
-
-        # Cree 2 orphelins en BDD
-        store = StateStore(self.settings)
-        store.mark_publish_in_flight(50, "B", 1, "m1.jpg", "c1")
-        store.mark_publish_in_flight(50, "B", 1, "m2.jpg", "c2")
-        store.close()
-
-        # Le worker doit les resoudre au demarrage
-        worker = Worker(self.settings)
-        worker._resolve_orphan_in_flight()
-
-        # Apres : zero orphan, 2 lignes dans media_published
-        self.assertEqual(worker._state.list_orphan_in_flight(), [])
-        conn = sqlite3.connect(str(self.settings.paths.state_db))
-        n = conn.execute(
-            "SELECT COUNT(*) FROM media_published WHERE run_id = 50"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(n, 2)
-        worker._state.close()
-
-
 # =================== _lib (dashboard) — defense en profondeur ===================
 
 class TestLibValidation(unittest.TestCase):

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import mimetypes
 import random
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
 import structlog
-from playwright.async_api import TimeoutError as PWTimeout
+from playwright.async_api import Page, TimeoutError as PWTimeout
 
 from ..browser.humanizer import Humanizer
 from ..browser.session import BrowserSession
@@ -166,28 +169,6 @@ class UploaderService:
             # Tirage aleatoire dans le cycle courant
             media = random.choice(pending)
             caption = self._captions.pick(batch_name=self._captions_batch_name)
-
-            # Securite idempotente : si une tentative precedente a deja
-            # depose un marqueur in_flight pour ce tuple, on considere que
-            # Fansly a peut-etre deja publie. On marque published sans
-            # republier (compromis : mieux vaut un manque qu un doublon).
-            if self._run_id is not None and self._state.has_publish_in_flight(
-                self._run_id, batch.name, batch.current_cycle, media.name
-            ):
-                log.warning(
-                    "uploader_skip_existing_in_flight",
-                    media=media.name,
-                    batch=batch.name,
-                    cycle=batch.current_cycle,
-                    run_id=self._run_id,
-                    rationale="precedente_tentative_peut-etre_aboutie",
-                )
-                self._mark_published(media, caption, batch.name, batch.current_cycle)
-                self._state.clear_publish_in_flight(
-                    self._run_id, batch.name, batch.current_cycle, media.name
-                )
-                return media.name
-
             log.info(
                 "uploader_starting",
                 media=media.name,
@@ -199,28 +180,15 @@ class UploaderService:
             try:
                 await self._auth.ensure_logged_in()
 
-                # Depose le marqueur in_flight AVANT le clic Post Fansly.
-                # On utilise la caption finale (avec #fyp si ajoute) en interne ;
-                # ici on stocke la caption d origine, suffisant pour le debug.
-                if self._run_id is not None:
-                    self._state.mark_publish_in_flight(
-                        self._run_id, batch.name, batch.current_cycle,
-                        media.name, caption,
-                    )
+                # Retry tenacity sur tout le upload : robustesse face aux
+                # timings cote Fansly (encodage video, latence reseau, etc.).
+                # Si le 1er essai echoue, on relance toute la sequence et
+                # Fansly a eu le temps de finaliser entre temps.
+                async for attempt in self._retries.network():
+                    with attempt:
+                        await self._do_upload(media, caption)
 
-                # IMPORTANT : pas de retry tenacity autour de _do_upload.
-                # Un retry apres un clic Post qui a abouti cote Fansly produit
-                # une double-publication. La robustesse est assuree par le
-                # marqueur in_flight ci-dessus et par la re-execution du
-                # publish_next au prochain tour de boucle worker.
-                await self._do_upload(media, caption)
-
-                # Succes confirme : on marque published puis on clear le marqueur
                 self._mark_published(media, caption, batch.name, batch.current_cycle)
-                if self._run_id is not None:
-                    self._state.clear_publish_in_flight(
-                        self._run_id, batch.name, batch.current_cycle, media.name
-                    )
                 log.info(
                     "uploader_published",
                     media=media.name,
@@ -230,9 +198,6 @@ class UploaderService:
                 return media.name
 
             except Exception as e:  # noqa: BLE001
-                # On laisse le marqueur in_flight en place — la prochaine fois
-                # qu on tente ce media (ou au demarrage suivant du worker),
-                # il sera traite comme deja publie pour eviter le doublon.
                 log.error("uploader_failed", media=media.name, error=str(e), exc_info=True)
                 await self._dump_artifact("upload_failed", media.name)
                 return None
@@ -241,6 +206,87 @@ class UploaderService:
 
     async def _do_upload(self, media: Path, caption: str) -> None:
         page = await self._session.page()
+
+        # ─── Instrumentation HTTP : capte tout le trafic vers fansly.com
+        # pendant l upload pour diagnostiquer d eventuels rejets cote serveur
+        # (status 4xx/5xx, headers manquants, etc.). Filtre minimal pour
+        # eviter le bruit (skip les assets statiques).
+        # IMPORTANT : on attache les listeners en debut d _do_upload et on
+        # les DETACHE en fin via try/finally. Sans ce detach, chaque appel
+        # successif a _do_upload accumule des listeners et chaque event est
+        # logge N fois (× nombre d appels precedents) — cree de fausses
+        # duplications dans les logs HTTP.
+        skip_resource_types = {"image", "stylesheet", "font", "media", "manifest", "other"}
+
+        async def _log_request(request):
+            try:
+                if "fansly.com" not in request.url:
+                    return
+                if request.resource_type in skip_resource_types:
+                    return
+                post_data_size = len(request.post_data or b"") if request.post_data else 0
+                ct = request.headers.get("content-type", "")
+                log.info(
+                    "http_req",
+                    method=request.method,
+                    url=request.url[:180],
+                    rtype=request.resource_type,
+                    ct=ct[:60],
+                    body_bytes=post_data_size,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.debug("http_req_log_error", error=str(e))
+
+        async def _log_response(response):
+            try:
+                if "fansly.com" not in response.url:
+                    return
+                req = response.request
+                if req.resource_type in skip_resource_types:
+                    return
+                status = response.status
+                body_preview = ""
+                if status >= 400:
+                    try:
+                        body = await response.text()
+                        body_preview = body[:500]
+                    except Exception:  # noqa: BLE001
+                        body_preview = "<unreadable>"
+                log.info(
+                    "http_resp",
+                    status=status,
+                    method=req.method,
+                    url=response.url[:180],
+                    body=body_preview if status >= 400 else None,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.debug("http_resp_log_error", error=str(e))
+
+        # On garde une reference aux callbacks pour pouvoir les detacher.
+        def _on_req(req):
+            asyncio.create_task(_log_request(req))
+
+        def _on_resp(resp):
+            asyncio.create_task(_log_response(resp))
+
+        page.on("request", _on_req)
+        page.on("response", _on_resp)
+        log.info("http_instrumentation_attached")
+
+        try:
+            await self._do_upload_inner(page, media, caption)
+        finally:
+            try:
+                page.remove_listener("request", _on_req)
+                page.remove_listener("response", _on_resp)
+                log.info("http_instrumentation_detached")
+            except Exception as e:  # noqa: BLE001
+                log.warning("http_instrumentation_detach_failed", error=str(e))
+
+    async def _do_upload_inner(self, page, media: Path, caption: str) -> None:
+        """Implementation interne de _do_upload (sans gestion des listeners
+        HTTP). Permet a `_do_upload` de gerer l attach/detach dans un
+        try/finally proprement, sans dupliquer le code metier."""
         await page.goto(self._settings.auth.base_url + "/home", wait_until="domcontentloaded")
         await self._humanizer.long_pause()
         await self._auth._dismiss_overlays(page)  # type: ignore[attr-defined]
@@ -259,16 +305,21 @@ class UploaderService:
         await self._humanizer.type_humanly(textarea, caption)
         await self._humanizer.short_pause()
 
-        # 2) Attacher le fichier PRINCIPAL via input[0]
-        # Sur Fansly 2026 : un seul input[type=file] est present initialement
-        # (input[0], multiple). L'upload de ce fichier ouvre la modale
-        # "Upload Media" qui expose 2 inputs supplementaires : input[1] pour la
-        # PREVIEW et input[2] pour ajouter d'autres medias.
+        # 2) Attacher le fichier PRINCIPAL.
+        # NOTE technique : `set_input_files` de Playwright ne declenche pas
+        # toujours les events que l app Fansly (Angular) ecoute. Resultat
+        # observe : le fichier est pose dans le DOM mais aucune requete XHR
+        # d upload ne part vers les serveurs Fansly → la modale affiche
+        # "no content selected" et le bouton final reste indisponible.
+        # On utilise un drop simule via DataTransfer : on construit un File
+        # JS natif a partir du contenu du fichier et on dispatche les events
+        # dragenter/dragover/drop sur l input, exactement comme si l utilisateur
+        # avait depose le fichier physiquement.
         inputs = Sel.file_input(page)
         n_inputs = await inputs.count()
         if n_inputs == 0:
             raise RuntimeError("Aucun input[type=file] trouve dans le composer.")
-        await inputs.nth(0).set_input_files(str(media))
+        await self._drop_file_into_input(page, inputs.nth(0), media)
         log.info("uploader_main_uploaded", media=media.name)
         await self._humanizer.long_pause()
 
@@ -290,7 +341,8 @@ class UploaderService:
         log.info("uploader_inputs_after_main", count=n_after)
         if n_after >= 2:
             try:
-                await inputs_after.nth(1).set_input_files(str(media))
+                # Meme strategie que pour le main : drop simule via DataTransfer
+                await self._drop_file_into_input(page, inputs_after.nth(1), media)
                 log.info("uploader_preview_uploaded", media=media.name)
             except Exception as e:  # noqa: BLE001
                 log.warning("uploader_preview_upload_failed", error=str(e))
@@ -349,9 +401,9 @@ class UploaderService:
         submit = Sel.submit_post_button(page)
         await submit.wait_for(state="visible", timeout=30_000)
 
-        deadline = asyncio.get_event_loop().time() + 180
+        deadline = time.monotonic() + 180
         wait_count = 0
-        while asyncio.get_event_loop().time() < deadline:
+        while time.monotonic() < deadline:
             cls = (await submit.get_attribute("class")) or ""
             if "disabled" not in cls:
                 break
@@ -444,6 +496,83 @@ class UploaderService:
 
         await self._humanizer.long_pause()
         log.info("uploader_post_submitted", media=media.name)
+
+    # ---------- attachement de fichier via drop simule ----------
+
+    async def _drop_file_into_input(self, page: Page, input_locator, media: Path) -> None:
+        """Attache un fichier a un <input type="file"> via un evenement
+        drop synthetique avec DataTransfer.
+
+        Pourquoi pas `set_input_files` (Playwright) :
+            Playwright ecrit le fichier dans l input mais le change event
+            n est pas toujours capte par les apps Angular qui ecoutent le
+            DataTransfer / drop natif. Resultat : aucune requete XHR
+            d upload n est lancee et le serveur ne recoit jamais le fichier.
+
+        Strategie :
+            1. Lire le contenu binaire du fichier cote Python.
+            2. L injecter dans le navigateur en base64 via page.evaluate.
+            3. Cote JS : decoder en Uint8Array → construire un File natif
+               → mettre dans un DataTransfer → dispatcher
+               dragenter/dragover/drop sur l element cible.
+            Le browser traite l upload comme s il venait d un vrai user.
+
+        Cout : transit base64 via CDP (gros pour videos). Acceptable
+        pour des medias < 100 Mo. Si plus gros, prevoir un serveur HTTP
+        local de fichiers et faire le drop via une URL.
+        """
+        file_bytes = media.read_bytes()
+        if not file_bytes:
+            raise RuntimeError(f"Fichier vide : {media}")
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+        mime, _ = mimetypes.guess_type(media.name)
+        if not mime:
+            mime = "application/octet-stream"
+        log.info(
+            "drop_file_starting",
+            media=media.name,
+            size_bytes=len(file_bytes),
+            mime=mime,
+        )
+
+        # On utilise evaluate_handle pour passer l input locator au JS.
+        element = await input_locator.element_handle()
+        if element is None:
+            raise RuntimeError("Input file introuvable au moment du drop.")
+
+        await page.evaluate(
+            """
+            async ({input, name, b64, mime}) => {
+                // Decodage base64 → Uint8Array
+                const binStr = atob(b64);
+                const len = binStr.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
+
+                const file = new File([bytes], name, {type: mime, lastModified: Date.now()});
+                const dt = new DataTransfer();
+                dt.items.add(file);
+
+                // Pose le fichier dans input.files puis dispatch UN SEUL event :
+                // `change`, l event standard que tout composant qui consomme un
+                // <input type="file"> ecoute. Avec bubbles=true mais SANS les
+                // events drag-drop (qui creaient 3 uploads dupliques par
+                // propagation aux containers parents Angular).
+                try {
+                    Object.defineProperty(input, 'files', {
+                        value: dt.files,
+                        writable: false,
+                        configurable: true,
+                    });
+                } catch (e) {
+                    // Si redefinition refusee, on tente quand meme le change.
+                }
+                input.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+            }
+            """,
+            {"input": element, "name": media.name, "b64": b64, "mime": mime},
+        )
+        log.info("drop_file_done", media=media.name)
 
     # ---------- post-traitement ----------
 

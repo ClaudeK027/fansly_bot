@@ -5,7 +5,7 @@
 .env.backup
 .env.*
 !.env.example
-data/browser_profile/
+data/browser_profile*/
 data/logs/
 # SQLite en mode WAL genere state.db, state.db-wal, state.db-shm — un glob
 # unique couvre tous les fichiers compagnons. Ces fichiers contiennent
@@ -60,3 +60,4 @@ donnees.txt
 
 # Outils internes (config Claude Code)
 .claude/
+config.yaml.bak

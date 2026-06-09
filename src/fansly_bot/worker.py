@@ -177,11 +177,6 @@ class Worker:
         recovered = self._state.recover_stale_jobs()
         if recovered:
             log.warning("worker_recovered_stale_jobs", count=recovered)
-        # Resout les publications 'in_flight' orphelines : un crash entre le
-        # clic Post Fansly et la confirmation locale a laisse des marqueurs.
-        # Compromis assume : on les considere comme publies (mieux vaut un
-        # manque qu un doublon).
-        self._resolve_orphan_in_flight()
         # Nettoie un active_batch residuel (kill brutal du worker precedent
         # alors qu'un cycle de publication etait en cours). Sans ca, l UI
         # affiche en permanence le bandeau "lot actif" alors qu'aucun job
@@ -241,49 +236,6 @@ class Worker:
         log.info("worker_stop_requested", graceful=True)
         self._stop_event.set()
 
-    def _resolve_orphan_in_flight(self) -> None:
-        """Traite les marqueurs publish_in_flight orphelins d un crash precedent.
-
-        Pour chacun : on enregistre dans media_published (l idempotence est
-        garantie par la cle composite — re-execution sans risque) puis on
-        supprime le marqueur. On ne touche PAS a active_batch
-        (published_in_cycle) car la BDD de progression du cycle peut ne plus
-        correspondre au run qui a depose le marqueur.
-        """
-        orphans = self._state.list_orphan_in_flight()
-        if not orphans:
-            return
-        log.warning(
-            "worker_resolving_orphan_in_flight",
-            count=len(orphans),
-            rationale="crash_precedent_supposition_publication_aboutie_fansly",
-        )
-        for o in orphans:
-            try:
-                self._state.record_media_published(
-                    o["media_filename"],
-                    o["caption_used"] or "",
-                    batch_name=o["batch_name"],
-                    cycle_number=o["cycle_number"],
-                    run_id=o["run_id"],
-                )
-                self._state.clear_publish_in_flight(
-                    o["run_id"], o["batch_name"], o["cycle_number"],
-                    o["media_filename"],
-                )
-                log.info(
-                    "orphan_in_flight_resolved",
-                    run_id=o["run_id"],
-                    batch=o["batch_name"],
-                    cycle=o["cycle_number"],
-                    media=o["media_filename"],
-                )
-            except Exception as e:  # noqa: BLE001
-                log.error(
-                    "orphan_in_flight_resolution_failed",
-                    error=str(e),
-                    orphan=o,
-                )
 
     # ---------- execution ----------
 
