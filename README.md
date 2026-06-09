@@ -73,7 +73,7 @@ Python est nécessaire **uniquement pour l'étape d'authentification initiale** 
 ### 1. Cloner le projet
 
 ```bash
-git clone <URL_DU_REPO> fansly-bot
+git clone fansly-bot](https://github.com/ClaudeK027/fansly_bot
 cd fansly-bot
 ```
 
