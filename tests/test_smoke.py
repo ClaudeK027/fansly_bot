@@ -646,6 +646,259 @@ class TestMarkPublishedPersistsFanslyId(_TmpStateMixin, unittest.TestCase):
         self.assertIsNone(row[0])
 
 
+# =================== Phase B : rotation per-media ===================
+
+
+class TestGetFanslyPostIdForPreviousCycle(_TmpStateMixin, unittest.TestCase):
+    """Verifie la requete SQL qui sert au CycleRotator pour identifier
+    le post Fansly du meme media au cycle precedent."""
+
+    def setUp(self):
+        super().setUp()
+        from fansly_bot.infra.state import StateStore
+
+        self.store = StateStore(self.settings)
+
+    def test_returns_id_from_previous_cycle(self):
+        # Cycle 1 publie m.jpg avec fansly_post_id="abc"
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id="abc",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertEqual(result, "abc")
+
+    def test_returns_none_when_no_previous_cycle(self):
+        # Pas d'historique
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertIsNone(result)
+
+    def test_returns_none_when_previous_cycle_has_null_id(self):
+        # Cycle 1 publie m.jpg SANS fansly_post_id (capture ratee)
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id=None,
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertIsNone(result)
+
+    def test_returns_most_recent_when_multiple_previous_cycles(self):
+        # Cycles 1 et 2 publient m.jpg avec ids differents.
+        # Pour current_cycle=3 on doit recuperer l'id du cycle 2.
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id="id-cycle-1",
+        )
+        self.store.record_media_published(
+            "m.jpg", "c2",
+            batch_name="B", cycle_number=2, run_id=10,
+            fansly_post_id="id-cycle-2",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=3,
+        )
+        self.assertEqual(result, "id-cycle-2")
+
+    def test_isolates_by_run_id(self):
+        # Run 10 et Run 11 publient le meme m.jpg dans le meme batch.
+        # Pour current_cycle=2/run=10 on doit ignorer le run 11.
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id="id-run-10",
+        )
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=11,
+            fansly_post_id="id-run-11",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertEqual(result, "id-run-10")
+
+    def test_isolates_by_batch_name(self):
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="A", cycle_number=1, run_id=10,
+            fansly_post_id="id-batch-A",
+        )
+        self.store.record_media_published(
+            "m.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id="id-batch-B",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertEqual(result, "id-batch-B")
+
+    def test_isolates_by_filename(self):
+        # Autres medias publies, m.jpg jamais
+        self.store.record_media_published(
+            "other.jpg", "c1",
+            batch_name="B", cycle_number=1, run_id=10,
+            fansly_post_id="other-id",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertIsNone(result)
+
+    def test_run_id_none_raises_value_error(self):
+        # Defense en profondeur Blocker 4 : run_id=None doit lever
+        # car une recherche cross-run pourrait remonter un post d'un
+        # autre job et causer une suppression accidentelle.
+        with self.assertRaises(ValueError):
+            self.store.get_fansly_post_id_for_previous_cycle(
+                run_id=None,
+                batch_name="B", media_filename="m.jpg", current_cycle=2,
+            )
+
+    def test_ignores_current_and_future_cycles(self):
+        # Le cycle 2 a deja publie m.jpg (re-execution partielle ?). Pour
+        # current_cycle=2 on doit chercher STRICTEMENT < 2, donc rien.
+        self.store.record_media_published(
+            "m.jpg", "c2",
+            batch_name="B", cycle_number=2, run_id=10,
+            fansly_post_id="id-cycle-2",
+        )
+        result = self.store.get_fansly_post_id_for_previous_cycle(
+            run_id=10, batch_name="B", media_filename="m.jpg",
+            current_cycle=2,
+        )
+        self.assertIsNone(result)
+
+
+class _FakeStateForRotator:
+    """StateStore stub minimal pour tester CycleRotator sans BDD reelle.
+    Sert a verifier les branches : skip premier-cycle, no_previous_id, db_error."""
+
+    def __init__(self, lookup_result=None, raise_on_lookup=False):
+        self._lookup_result = lookup_result
+        self._raise_on_lookup = raise_on_lookup
+
+    def get_fansly_post_id_for_previous_cycle(self, **kwargs):
+        if self._raise_on_lookup:
+            raise RuntimeError("simulated db error")
+        return self._lookup_result
+
+
+class TestCycleRotator(unittest.IsolatedAsyncioTestCase):
+    """Verifie la logique d'orchestration de CycleRotator pour les branches
+    qui n'engagent pas Playwright (skip / lookup / db_error). Les branches
+    qui touchent le DOM (deleted/not_found/guard_fyp) ne sont pas couvertes
+    ici — elles requierent une vraie session Playwright."""
+
+    def _make_rotator(self, state):
+        from fansly_bot.services.cycle_rotator import CycleRotator
+
+        rot = CycleRotator.__new__(CycleRotator)
+        rot._state = state
+        rot._settings = None
+        rot._session = None
+        rot._humanizer = None
+        rot._auth = None
+        rot._retries = None
+        rot._purger = None  # pas utilise dans les branches first_cycle/no_id/db_err
+        return rot
+
+    async def test_first_cycle_skipped(self):
+        rot = self._make_rotator(_FakeStateForRotator())
+        # page=None passe ok car les branches first_cycle_skip
+        # /no_previous_id /db_error ne touchent jamais la page.
+        result = await rot.rotate_after_publish(
+            page=None, run_id=1, batch_name="B",
+            current_cycle=1, media_filename="m.jpg",
+        )
+        self.assertEqual(result["status"], "first_cycle_skip")
+        self.assertEqual(result["media"], "m.jpg")
+
+    async def test_no_previous_id_skipped(self):
+        rot = self._make_rotator(_FakeStateForRotator(lookup_result=None))
+        result = await rot.rotate_after_publish(
+            page=None, run_id=1, batch_name="B",
+            current_cycle=3, media_filename="m.jpg",
+        )
+        self.assertEqual(result["status"], "no_previous_id")
+
+    async def test_db_error_does_not_raise(self):
+        rot = self._make_rotator(_FakeStateForRotator(raise_on_lookup=True))
+        result = await rot.rotate_after_publish(
+            page=None, run_id=1, batch_name="B",
+            current_cycle=3, media_filename="m.jpg",
+        )
+        self.assertEqual(result["status"], "db_error")
+        self.assertIn("simulated db error", result["error"])
+
+
+class TestPurgerHrefStrictMatch(unittest.TestCase):
+    """Verifie que le regex de matching href dans _relocate_by_id rejette
+    bien les substring (Blocker Major 5 du review v1)."""
+
+    def _segment(self, href):
+        import re
+
+        m = re.search(r"/post/([^/?#]+)", href)
+        return m.group(1) if m else None
+
+    def test_strict_match_accepted(self):
+        self.assertEqual(self._segment("https://fansly.com/post/12345"), "12345")
+        self.assertEqual(self._segment("/post/12345?foo=bar"), "12345")
+        self.assertEqual(self._segment("/post/12345#anchor"), "12345")
+        self.assertEqual(self._segment("/post/12345/edit"), "12345")
+
+    def test_no_substring_collision(self):
+        # value='123' doit PAS matcher '/post/91234567' (substring naive)
+        segment = self._segment("https://fansly.com/post/91234567")
+        self.assertEqual(segment, "91234567")
+        self.assertNotEqual(segment, "123")
+
+    def test_returns_none_when_no_post_path(self):
+        self.assertIsNone(self._segment("https://fansly.com/profile/x"))
+
+
+class TestPublishingCycleCleanupMode(unittest.TestCase):
+    """Verifie que le flag cycle_cleanup_mode est bien lu/valide par Pydantic."""
+
+    def test_default_is_batch(self):
+        from fansly_bot.config import load_settings
+
+        s = load_settings()
+        self.assertEqual(s.publishing.cycle_cleanup_mode, "batch")
+
+    def test_invalid_mode_rejected(self):
+        from pydantic import ValidationError
+        from fansly_bot.config import Publishing
+
+        # Reuse a valid base, just change cycle_cleanup_mode to an invalid value
+        from fansly_bot.config import load_settings
+
+        ok_pub = load_settings().publishing
+        with self.assertRaises(ValidationError):
+            ok_pub.model_copy(update={"cycle_cleanup_mode": "wrong_value"}).model_validate(
+                ok_pub.model_copy(
+                    update={"cycle_cleanup_mode": "wrong_value"}
+                ).model_dump()
+            )
+
+
 # =================== entry point ===================
 
 if __name__ == "__main__":

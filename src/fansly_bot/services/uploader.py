@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 import structlog
 from playwright.async_api import Page, TimeoutError as PWTimeout
 
+from typing import TYPE_CHECKING, Callable
+
 from ..browser.humanizer import Humanizer
 from ..browser.session import BrowserSession
 from ..config import Settings
@@ -25,6 +27,9 @@ from ..infra.state import StateStore
 from ..selectors import Sel
 from .auth import AuthService
 from .caption_picker import CaptionPicker
+
+if TYPE_CHECKING:
+    from .cycle_rotator import CycleRotator
 
 log = structlog.get_logger("services.uploader")
 
@@ -41,6 +46,8 @@ class UploaderService:
         retries: RetryPolicies,
         captions_batch_name: str | None = None,
         run_id: int | None = None,
+        cycle_rotator: Optional["CycleRotator"] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._settings = settings
         self._session = session
@@ -62,6 +69,16 @@ class UploaderService:
         # "postId") en escaladant en log.error apres N echecs successifs,
         # plutot que de tourner en silence avec 0% capture.
         self._capture_miss_streak: int = 0
+        # Service de rotation per-media. Si non-None (mode
+        # publishing.cycle_cleanup_mode='per_media' du worker), on
+        # invoque rotate_after_publish() APRES chaque publication reussie
+        # pour supprimer la version precedente du meme media. Si None
+        # (mode 'batch' historique), aucune rotation per-media.
+        self._cycle_rotator = cycle_rotator
+        # Closure d'annulation propagee par le worker
+        # (lambda: self._state.is_cancellation_requested(job.id)). Default
+        # = lambda: False si non fournie. Sert au cleaner ET au rotator.
+        self._cancel_check: Callable[[], bool] = cancel_check or (lambda: False)
 
     # ---------- API publique ----------
 
@@ -218,6 +235,34 @@ class UploaderService:
                     batch=batch.name,
                     cycle=batch.current_cycle,
                 )
+
+                # Rotation APRES publication reussie (Blocker 2 du review v1) :
+                # on supprime l'ancienne version du media seulement si le
+                # nouveau post a bien ete cree. Si la publication echoue,
+                # l'ancien post reste en place (pas de fenetre de visibilite
+                # vide). On passe la PAGE deja recuperee dans le contexte
+                # `async with self._session.use()` du publish_next pour
+                # eviter le deadlock (asyncio.Lock non-reentrant).
+                if self._cycle_rotator is not None:
+                    try:
+                        page = await self._session.page()
+                        rot_result = await self._cycle_rotator.rotate_after_publish(
+                            page=page,
+                            run_id=self._run_id,
+                            batch_name=batch.name,
+                            current_cycle=batch.current_cycle,
+                            media_filename=media.name,
+                            cancel_check=self._cancel_check,
+                        )
+                        log.info("uploader_rotation_result", **rot_result)
+                    except Exception as e:  # noqa: BLE001
+                        # Rotation echouee : on log mais on n'echoue pas la
+                        # publication (deja confirmee en BDD via _mark_published).
+                        log.error(
+                            "uploader_rotation_exception",
+                            error=type(e).__name__, media=media.name,
+                        )
+
                 return media.name
 
             except Exception as e:  # noqa: BLE001
