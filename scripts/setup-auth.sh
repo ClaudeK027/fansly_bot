@@ -88,10 +88,27 @@ cleanup_venv() {
     fi
 }
 
+# Fix bug libexpat sur macOS Apple Silicon : le Python Homebrew lie pyexpat
+# dynamiquement contre /usr/lib/libexpat.1.dylib (version systeme) au lieu
+# de /opt/homebrew/opt/expat/lib/libexpat.dylib. Symptome : `python -m venv`
+# echoue sur `ensurepip` avec un Symbol not found _XML_GetCurrentByteIndex.
+# Solution : exporter DYLD_LIBRARY_PATH si on est sur macOS arm64 et que
+# expat est present via brew. Autoset = aucune action requise de l'utilisateur.
+setup_macos_expat_workaround() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then return 0; fi
+    if [[ "$(uname -m)" != "arm64" ]]; then return 0; fi
+    local expat_lib="/opt/homebrew/opt/expat/lib"
+    if [[ ! -d "$expat_lib" ]]; then return 0; fi
+    if [[ ":${DYLD_LIBRARY_PATH:-}:" == *":$expat_lib:"* ]]; then return 0; fi
+    export DYLD_LIBRARY_PATH="$expat_lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    print_ok "macOS arm64 : DYLD_LIBRARY_PATH ajuste pour libexpat (auto)"
+}
+
 create_venv() {
     local python_cmd="$1"
     print_step "Création de l'environnement Python jetable"
     echo "  ${DIM}Utilisation de : $($python_cmd --version 2>&1)${RESET}"
+    setup_macos_expat_workaround
     "$python_cmd" -m venv "$VENV_DIR"
     print_ok "Venv créé : ${BOLD}$VENV_DIR${RESET}"
 }

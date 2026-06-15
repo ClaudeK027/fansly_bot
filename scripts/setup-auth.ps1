@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Authentifie le bot Fansly en lançant Chromium pour login manuel (Windows).
 

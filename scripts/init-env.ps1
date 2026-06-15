@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Crée interactivement le fichier .env nécessaire au bot Fansly (Windows).
 

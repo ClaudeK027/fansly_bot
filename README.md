@@ -73,9 +73,11 @@ Python est nécessaire **uniquement pour l'étape d'authentification initiale** 
 ### 1. Cloner le projet
 
 ```bash
-git clone <URL_DU_REPO> fansly-bot
+git clone https://github.com/ClaudeK027/fansly_bot.git fansly-bot
 cd fansly-bot
 ```
+
+> **Repo privé** : ton compte GitHub doit être ajouté comme collaborateur. Avec `gh` CLI déjà authentifié, tu peux aussi faire `gh repo clone ClaudeK027/fansly_bot fansly-bot`.
 
 ### 2. Créer le fichier `.env` (interactif)
 
@@ -187,24 +189,27 @@ docker compose exec fansly-bot bash
 Pour itérer rapidement sur le code sans rebuild Docker à chaque fois :
 
 ```bash
-# Crée le venv complet
-python3 -m venv .venv
+# Crée le venv (Python 3.11+ obligatoire — verifie avec `python3.12 --version`)
+python3.12 -m venv .venv
 source .venv/bin/activate         # macOS / Linux
 # .venv\Scripts\activate          # Windows
 
-# Installe le projet en mode editable
+# Installe le projet en mode editable (mappe automatiquement src/ via pyproject)
 pip install --upgrade pip
 pip install -e .
-playwright install chromium
+playwright install chromium       # ~300 Mo, 2-3 min
 
 # Lance le worker (dans un terminal)
 python -m fansly_bot worker
 
 # Lance Streamlit (dans un autre terminal)
 streamlit run src/fansly_dashboard/main.py
+
+# Tests de fumée (optionnel, ~0.5s)
+python -m unittest discover -s tests
 ```
 
-> **macOS** : si tu rencontres une erreur libexpat (`Symbol not found: _XML_GetCurrentByteIndex`), prefixe les commandes avec `DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib`.
+> **macOS Apple Silicon** : sur certains setups Homebrew, `python3.12 -m venv` plante sur `ensurepip` (`Symbol not found: _XML_GetCurrentByteIndex`). C'est un mismatch de libexpat. Solution : prefixer **toutes** les commandes ci-dessus avec `DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib` (les scripts `init-env.sh` / `setup-auth.sh` gèrent ça automatiquement).
 
 ---
 
