@@ -96,6 +96,19 @@ class Publishing(BaseModel):
     interval_minutes_min: float
     interval_minutes_max: float
     media_extensions: list[str]
+    # Mode de nettoyage des cycles. 'batch' (default) = comportement
+    # historique : a la transition cycle N -> N+1, on supprime EN BLOC
+    # tous les posts du cycle N via CycleCleaner. 'per_media' = APRES
+    # CHAQUE publication d'un media au cycle N+1, on supprime sa version
+    # publiee au cycle precedent via CycleRotator (rotation per-media).
+    # Le mode 'per_media' necessite que fansly_post_id ait ete capture
+    # lors de la publication initiale (Phase A) ; sinon degrade en skip.
+    cycle_cleanup_mode: Literal["batch", "per_media"] = "batch"
+    # Plafond de scroll lors d'une rotation per-media. Decouple du
+    # purge.scroll_safety_cap car la semantique est differente : on
+    # cherche UN post specifique dont on est sur qu'il existe (ID
+    # capture). Ne s'applique qu'en mode 'per_media'.
+    rotation_scroll_safety_cap: int = Field(default=200, ge=1)
 
     @field_validator("daily_window_local", mode="before")
     @classmethod

@@ -324,10 +324,33 @@ class Worker:
                 raise RuntimeError(
                     f"Job {job.id} : captions_batch_name invalide ({e})"
                 ) from e
+        # Mode de nettoyage : 'batch' (default historique : CycleCleaner
+        # en bloc a la transition) ou 'per_media' (CycleRotator : suppression
+        # 1-pour-1 du media correspondant juste AVANT chaque publication).
+        cleanup_mode = custom_settings.publishing.cycle_cleanup_mode
+        log.info(
+            "publish_cleanup_mode_resolved",
+            cycle_cleanup_mode=cleanup_mode,
+            job_id=job.id,
+        )
+
+        # Le CycleRotator n'est construit et injecte dans l'uploader que
+        # si le mode est 'per_media'. En 'batch' on garde le flow actuel
+        # inchange (uploader sans rotator = pas de pre-publish hook).
+        rotator = None
+        if cleanup_mode == "per_media":
+            from .services.cycle_rotator import CycleRotator
+
+            rotator = CycleRotator(
+                custom_settings, session, humanizer, auth, self._state, retries,
+            )
+
         uploader = UploaderService(
             custom_settings, session, humanizer, auth, captions, self._state, retries,
             captions_batch_name=captions_batch_name,
             run_id=job.id,
+            cycle_rotator=rotator,
+            cancel_check=lambda: self._state.is_cancellation_requested(job.id),
         )
         if captions_batch_name:
             log.info("publish_captions_batch", name=captions_batch_name)
@@ -336,8 +359,17 @@ class Worker:
         cleaner = CycleCleaner(
             custom_settings, session, humanizer, auth, self._state, retries
         )
-        delete_previous_cycle = bool(cfg.get("delete_previous_cycle", True))
-        log.info("publish_cleanup_mode", delete_previous_cycle=delete_previous_cycle)
+        # En mode 'per_media' on neutralise le cleanup batch en fin de cycle :
+        # la rotation se fait deja au cas par cas avant chaque publication.
+        # En mode 'batch' on respecte le flag job-level historique.
+        delete_previous_cycle = (
+            cleanup_mode == "batch" and bool(cfg.get("delete_previous_cycle", True))
+        )
+        log.info(
+            "publish_cleanup_mode",
+            cycle_cleanup_mode=cleanup_mode,
+            delete_previous_cycle=delete_previous_cycle,
+        )
 
         await session.start()
         try:

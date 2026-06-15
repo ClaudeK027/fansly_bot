@@ -60,6 +60,14 @@ publishing:
   interval_minutes_min: 0.1
   interval_minutes_max: 1.0
   media_extensions: [".mp4", ".avi", ".mov", ".mkv", ".jpg", ".jpeg", ".png", ".webm"]
+  # Mode de nettoyage des cycles :
+  #   "batch"     (default) - supprime EN BLOC les posts du cycle N a la
+  #                           transition N -> N+1 (CycleCleaner).
+  #   "per_media"          - rotation per-media : avant chaque publication
+  #                           du cycle N+1, supprime la version precedente
+  #                           du meme media (CycleRotator). Necessite que
+  #                           fansly_post_id ait ete capture (Phase A).
+  cycle_cleanup_mode: "batch"
 
 purge:
   enabled: true

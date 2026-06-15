@@ -341,6 +341,54 @@ class StateStore:
                 ),
             )
 
+    def get_fansly_post_id_for_previous_cycle(
+        self,
+        run_id: int,
+        batch_name: str,
+        media_filename: str,
+        current_cycle: int,
+    ) -> str | None:
+        """Cherche l'ID Fansly du meme media publie dans un cycle ANTERIEUR
+        du MEME run/batch. Utilise par le CycleRotator pour identifier le
+        post precedent a supprimer avant de republier ce media au cycle
+        courant.
+
+        Strategie : on prend le cycle le plus recent strictement inferieur
+        a `current_cycle`. Si plusieurs lignes existent (idempotence non
+        garantie sur d'anciens runs), on garde celle avec l'id BDD le plus
+        grand (= la plus recente inseree).
+
+        SECURITE : `run_id` est OBLIGATOIRE (raise ValueError si None). Une
+        recherche cross-run pourrait remonter l'id d'un post publie par un
+        autre run sur le meme batch — risque de suppression accidentelle.
+        L'isolation par run_id est la SEULE garantie de coherence.
+
+        Retourne None si :
+          - aucun cycle precedent n'a publie ce media (ex. premier cycle)
+          - le cycle precedent existe mais sans fansly_post_id (capture
+            ratee) — pas de rotation possible pour ce media-ci.
+        """
+        if run_id is None:
+            raise ValueError(
+                "run_id is required for cross-cycle lookup "
+                "(cross-run lookup is unsafe and disabled)"
+            )
+        cur = self._conn.execute(
+            """
+            SELECT fansly_post_id FROM media_published
+            WHERE run_id = ?
+              AND batch_name = ?
+              AND media_filename = ?
+              AND cycle_number < ?
+              AND fansly_post_id IS NOT NULL
+            ORDER BY cycle_number DESC, id DESC
+            LIMIT 1
+            """,
+            (run_id, batch_name, media_filename, current_cycle),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
     # ----- publish_in_flight -----
 
     def mark_publish_in_flight(
