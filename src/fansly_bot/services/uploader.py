@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import mimetypes
 import random
 import re
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import structlog
 from playwright.async_api import Page, TimeoutError as PWTimeout
@@ -55,6 +57,11 @@ class UploaderService:
         # empeche le cleaner inter-cycle de comptabiliser des publications
         # d un run anterieur sur le meme lot.
         self._run_id = run_id
+        # Compteur de captures d'ID Fansly ratees consecutives. Sert a
+        # detecter un drift de schema API (ex. Fansly renomme "id" en
+        # "postId") en escaladant en log.error apres N echecs successifs,
+        # plutot que de tourner en silence avec 0% capture.
+        self._capture_miss_streak: int = 0
 
     # ---------- API publique ----------
 
@@ -148,12 +155,12 @@ class UploaderService:
         via advance_cycle_if_needed() (decouplage pour eviter race condition
         avec le rolling cycle cleanup).
 
-        Idempotence : on inscrit un marqueur 'in_flight' AVANT le clic Post
-        Fansly. Si la tentative plante (composer qui ne ferme pas, etc.),
-        le marqueur reste en place. Au prochain passage sur le meme media,
-        ou au prochain demarrage du worker, ce marqueur indique 'la tentative
-        a peut-etre abouti cote Fansly mais on n a pas pu confirmer'. On le
-        traite alors comme publie pour eviter une republication.
+        Capture de l'ID Fansly du post fraichement cree : un buffer local
+        `captured = {"value": None}` est cree ICI et passe a _do_upload.
+        La closure _log_response y depose l'ID extrait du payload de la
+        reponse POST /api/v1/post. Le buffer est partage entre toutes les
+        tentatives tenacity de cette publication (premier-gagne strict :
+        une fois l'ID capte, les retries ne l'ecrasent pas).
         """
         async with self._session.use():
             batch = self._state.get_active_batch()
@@ -177,6 +184,19 @@ class UploaderService:
                 caption_length=len(caption),
             )
 
+            # Buffer local de capture, partage entre toutes les tentatives
+            # tenacity de cette publication. Initialise UNE SEULE FOIS ici :
+            # si la tentative 1 capture l'ID Fansly (POST /api/v1/post 2xx)
+            # mais echoue plus loin (ex: composer qui ne se ferme pas), la
+            # tentative 2 peut succeder cote bot SANS re-trigger un POST
+            # (le post est deja publie cote Fansly). On conserve donc l'ID
+            # capte au premier essai. Premier-gagne strict : si plusieurs
+            # 2xx arrivent, on garde le tout premier.
+            # Dict mutable pour pouvoir etre modifie par closure dans
+            # _log_response, sans repasser par un attribut d'instance
+            # (eliminerait le risque de corruption cross-upload).
+            captured: dict = {"value": None}
+
             try:
                 await self._auth.ensure_logged_in()
 
@@ -186,9 +206,12 @@ class UploaderService:
                 # Fansly a eu le temps de finaliser entre temps.
                 async for attempt in self._retries.network():
                     with attempt:
-                        await self._do_upload(media, caption)
+                        await self._do_upload(media, caption, captured)
 
-                self._mark_published(media, caption, batch.name, batch.current_cycle)
+                fp_id = captured.get("value")
+                self._mark_published(
+                    media, caption, batch.name, batch.current_cycle, fp_id,
+                )
                 log.info(
                     "uploader_published",
                     media=media.name,
@@ -204,7 +227,18 @@ class UploaderService:
 
     # ---------- coeur du flow Playwright ----------
 
-    async def _do_upload(self, media: Path, caption: str) -> None:
+    async def _do_upload(
+        self, media: Path, caption: str, captured: dict,
+    ) -> None:
+        """Pilote un upload complet. Le buffer `captured` (cree par
+        publish_next, partage entre les tentatives tenacity de la meme
+        publication) sera renseigne par la closure _log_response si la
+        reponse 2xx de POST /api/v1/post arrive pendant ce flow.
+
+        IMPORTANT : on NE reset PAS captured ici. Si la tentative 1 capture
+        l'ID puis echoue plus tard cote bot, la tentative 2 a deja l'ID au
+        cas ou Fansly ne re-emettrait pas de POST (post deja publie cote
+        serveur). Premier-gagne strict via _capture_fansly_post_id."""
         page = await self._session.page()
 
         # ─── Instrumentation HTTP : capte tout le trafic vers fansly.com
@@ -218,9 +252,26 @@ class UploaderService:
         # duplications dans les logs HTTP.
         skip_resource_types = {"image", "stylesheet", "font", "media", "manifest", "other"}
 
+        # Tasks de logging/capture en vol ; on les drain au finally pour
+        # eliminer la race ou la task de capture ecrirait dans captured
+        # APRES la lecture par publish_next (donnant un fansly_post_id None
+        # pour une publication ou Fansly avait pourtant repondu 200 avec id).
+        pending_tasks: list[asyncio.Task] = []
+
+        def _is_fansly_host(url: str) -> bool:
+            # Defense en profondeur : ne pas filtrer sur substring "fansly.com"
+            # (qui matche aussi "fansly.com.attacker.example"). On extrait
+            # l'hostname propre via urlparse et on verifie l'appartenance
+            # stricte au domaine fansly.com.
+            try:
+                host = (urlparse(url).hostname or "").lower()
+            except Exception:  # noqa: BLE001
+                return False
+            return host == "fansly.com" or host.endswith(".fansly.com")
+
         async def _log_request(request):
             try:
-                if "fansly.com" not in request.url:
+                if not _is_fansly_host(request.url):
                     return
                 if request.resource_type in skip_resource_types:
                     return
@@ -239,7 +290,7 @@ class UploaderService:
 
         async def _log_response(response):
             try:
-                if "fansly.com" not in response.url:
+                if not _is_fansly_host(response.url):
                     return
                 req = response.request
                 if req.resource_type in skip_resource_types:
@@ -248,7 +299,7 @@ class UploaderService:
                 body_preview = ""
                 if status >= 400:
                     try:
-                        body = await response.text()
+                        body = await asyncio.wait_for(response.text(), timeout=5.0)
                         body_preview = body[:500]
                     except Exception:  # noqa: BLE001
                         body_preview = "<unreadable>"
@@ -259,15 +310,26 @@ class UploaderService:
                     url=response.url[:180],
                     body=body_preview if status >= 400 else None,
                 )
+                # Capture passive de l ID Fansly du post fraichement cree.
+                # On parse uniquement les reponses 2xx de POST sur le path
+                # EXACT /api/v1/post (creation) — pas /api/v1/post/<id>/<action>
+                # (like, delete, etc.) ni d'autres prefixes accidentels.
+                if (
+                    200 <= status < 300
+                    and req.method == "POST"
+                    and self._is_post_creation_url(response.url)
+                ):
+                    await self._capture_fansly_post_id(response, captured)
             except Exception as e:  # noqa: BLE001
                 log.debug("http_resp_log_error", error=str(e))
 
-        # On garde une reference aux callbacks pour pouvoir les detacher.
+        # Wrap les coroutines dans des tasks trackees, pour pouvoir les
+        # drainer en finally avant de retourner (sinon race fire-and-forget).
         def _on_req(req):
-            asyncio.create_task(_log_request(req))
+            pending_tasks.append(asyncio.create_task(_log_request(req)))
 
         def _on_resp(resp):
-            asyncio.create_task(_log_response(resp))
+            pending_tasks.append(asyncio.create_task(_log_response(resp)))
 
         page.on("request", _on_req)
         page.on("response", _on_resp)
@@ -276,12 +338,51 @@ class UploaderService:
         try:
             await self._do_upload_inner(page, media, caption)
         finally:
+            # Ordre IMPORTANT : on detache d'abord les listeners (plus
+            # aucune nouvelle task ne sera append a pending_tasks), puis
+            # on drain ce qui est en vol. Sans cet ordre, une task creee
+            # in-extremis APRES le snapshot du gather ne serait jamais
+            # attendue — race fire-and-forget non eteinte.
             try:
                 page.remove_listener("request", _on_req)
                 page.remove_listener("response", _on_resp)
-                log.info("http_instrumentation_detached")
             except Exception as e:  # noqa: BLE001
                 log.warning("http_instrumentation_detach_failed", error=str(e))
+
+            # Drain : on attend les tasks en vol AVANT de retourner. Sans
+            # ca, la task qui parse POST /api/v1/post peut ecrire dans
+            # captured APRES que publish_next ait deja lu None.
+            if pending_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_tasks, return_exceptions=True),
+                        timeout=8.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Timeout : on ne laisse PAS les tasks en vol — sinon
+                    # elles ecriraient dans captured APRES que publish_next
+                    # ait deja lu (resurgence de la race blocker-1). On les
+                    # cancel, puis on draine les cancellations.
+                    log.warning(
+                        "http_instrumentation_drain_timeout",
+                        pending=len(pending_tasks),
+                    )
+                    for t in pending_tasks:
+                        if not t.done():
+                            t.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending_tasks, return_exceptions=True),
+                            timeout=2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        log.error(
+                            "http_instrumentation_drain_cancel_timeout",
+                            still_pending=sum(1 for t in pending_tasks if not t.done()),
+                        )
+                except Exception as e:  # noqa: BLE001
+                    log.debug("http_instrumentation_drain_error", error=str(e))
+            log.info("http_instrumentation_detached")
 
     async def _do_upload_inner(self, page, media: Path, caption: str) -> None:
         """Implementation interne de _do_upload (sans gestion des listeners
@@ -577,17 +678,141 @@ class UploaderService:
     # ---------- post-traitement ----------
 
     def _mark_published(
-        self, media: Path, caption: str, batch_name: str, cycle: int
+        self, media: Path, caption: str, batch_name: str, cycle: int,
+        fansly_post_id: Optional[str],
     ) -> None:
         """Mode lot : on NE deplace PAS le fichier (il sera republie au prochain
         cycle). On enregistre la publication en BDD et on marque le fichier
-        comme publie dans le cycle courant."""
+        comme publie dans le cycle courant.
+
+        Si l ID Fansly du post a ete capture pendant _do_upload (via le
+        listener HTTP sur POST /api/v1/post), on le persiste avec la
+        publication. Sinon le champ reste NULL et la rotation per-media
+        ne pourra pas cibler ce post (fallback : pas de rotation pour
+        cette publication-la)."""
         self._state.add_to_batch_published(media.name)
         self._state.record_media_published(
             media.name, caption,
             batch_name=batch_name, cycle_number=cycle,
             run_id=self._run_id,
+            fansly_post_id=fansly_post_id,
         )
+        if fansly_post_id:
+            log.info(
+                "uploader_mark_published_with_fansly_id",
+                media=media.name, fansly_post_id=fansly_post_id,
+            )
+        else:
+            log.warning(
+                "uploader_mark_published_without_fansly_id",
+                media=media.name,
+                reason="fansly_post_id_capture_failed_or_not_intercepted",
+            )
+
+    @staticmethod
+    def _is_post_creation_url(url: str) -> bool:
+        """Renvoie True ssi l'URL est exactement le endpoint de creation
+        de post Fansly (POST /api/v1/post). Exclut explicitement les
+        sous-paths d'action (/api/v1/post/<id>/like, /delete, etc.) et
+        les variantes accidentelles (/api/v1/repost, /api/v2/api/v1/post)."""
+        try:
+            path = urlparse(url).path
+        except Exception:  # noqa: BLE001
+            return False
+        return path.rstrip("/") == "/api/v1/post"
+
+    async def _capture_fansly_post_id(self, response, captured: dict) -> None:
+        """Parse la reponse JSON de POST /api/v1/post pour extraire l ID
+        du post fraichement cree et le stocker dans `captured["value"]`.
+
+        Premier-gagne strict : si captured["value"] est deja renseigne (par
+        une reponse precedente du meme upload, ou par la tentative tenacity
+        precedente), on NE remplace PAS. Cela protege contre :
+          - Plusieurs reponses 2xx /api/v1/post pendant le meme _do_upload
+            (draft auto + publication finale), dont l'ordre d'arrivee asyncio
+            n'est pas deterministe.
+          - Retry tenacity ou la tentative 2 ne re-trigger pas de POST mais
+            ou Fansly avait deja repondu OK a la tentative 1.
+
+        Formats observes sur l API Fansly (variantes possibles selon endpoint) :
+          - {"success": true, "response": {"id": "<numeric>", ...}}
+          - {"success": true, "response": [{"id": "<numeric>", ...}]}
+          - {"id": "<numeric>", ...}              (fallback racine)
+          - [{"id": "<numeric>", ...}]            (top-level array)
+
+        Defensive : toute exception est logguee en debug et n empeche pas
+        le flow upload de poursuivre. Si N captures consecutives echouent,
+        on escalade en log.error pour signaler un eventuel drift de schema
+        API Fansly (renommage de cle, changement de structure)."""
+        # Premier-gagne : on ne re-ecrit pas une valeur deja capturee.
+        if captured.get("value") is not None:
+            return
+        try:
+            body = await asyncio.wait_for(response.text(), timeout=5.0)
+        except Exception as e:  # noqa: BLE001
+            log.debug("fansly_post_id_capture_body_unreadable", error=str(e))
+            return
+        try:
+            data = json.loads(body)
+        except Exception as e:  # noqa: BLE001
+            log.debug("fansly_post_id_capture_json_parse_failed", error=str(e))
+            return
+
+        # Recherche non-exclusive : on essaye plusieurs emplacements, on
+        # garde la premiere valeur non vide trouvee.
+        fp_id = None
+        block = data.get("response") if isinstance(data, dict) else None
+        if isinstance(block, dict):
+            fp_id = block.get("id")
+        elif isinstance(block, list) and block and isinstance(block[0], dict):
+            fp_id = block[0].get("id")
+        if (fp_id is None or str(fp_id) == "") and isinstance(data, dict):
+            fp_id = data.get("id")
+        if (fp_id is None or str(fp_id) == "") and isinstance(data, list) and data and isinstance(data[0], dict):
+            fp_id = data[0].get("id")
+
+        if fp_id is not None and str(fp_id) != "":
+            # Premier-gagne ATOMIQUE : on a possiblement yield-e sur
+            # response.text() + json.loads pendant que d'autres tasks
+            # concurrentes (cas plusieurs reponses 2xx parallels) ont
+            # peut-etre deja ecrit dans captured. Re-verifier ICI, juste
+            # avant l'ecriture, garantit que la premiere valeur durablement
+            # ecrite est conservee (et non la derniere a finir le parse).
+            if captured.get("value") is not None:
+                log.debug(
+                    "uploader_fansly_post_id_race_lost",
+                    candidate=str(fp_id),
+                    kept=captured["value"],
+                )
+                return
+            captured["value"] = str(fp_id)
+            self._capture_miss_streak = 0
+            log.debug("uploader_captured_fansly_post_id", fansly_post_id=str(fp_id))
+        else:
+            # PII redact : on ne logue PAS le body brut (peut contenir
+            # accountId du createur, caption, mediaIds, tokens internes).
+            # Seules les CLES top-level sont expose pour diagnostic schema.
+            if isinstance(data, dict):
+                shape = sorted(list(data.keys()))[:10]
+            elif isinstance(data, list):
+                shape = ["<list>"]
+            else:
+                shape = [type(data).__name__]
+            self._capture_miss_streak += 1
+            log.warning(
+                "fansly_post_id_not_in_response",
+                top_level_keys=shape,
+                miss_streak=self._capture_miss_streak,
+            )
+            # Escalade : N echecs consecutifs = drift probable de l'API
+            # Fansly (renommage de cle, restructuration). On veut un
+            # signal fort pour ne pas tourner en silence avec 0% capture.
+            if self._capture_miss_streak >= 3:
+                log.error(
+                    "fansly_post_id_capture_drift_suspected",
+                    consecutive_misses=self._capture_miss_streak,
+                    hint="API schema may have changed; check top_level_keys above",
+                )
 
     async def _dump_artifact(self, label: str, media_name: str) -> None:
         from datetime import datetime, timezone

@@ -377,6 +377,275 @@ class TestLibValidation(unittest.TestCase):
         self.assertEqual(d["description"], "lot ete")
 
 
+# =================== Phase A : capture fansly_post_id ===================
+
+
+class _FakeResponse:
+    """Mock minimal d'une Response Playwright pour tester
+    UploaderService._capture_fansly_post_id. Si `slow_ms` est > 0, le
+    `text()` simule une latence reseau (utile pour tester les races)."""
+
+    def __init__(self, body_text: str, slow_ms: int = 0) -> None:
+        self._body = body_text
+        self._slow_ms = slow_ms
+
+    async def text(self) -> str:
+        if self._slow_ms > 0:
+            import asyncio as _aio
+
+            await _aio.sleep(self._slow_ms / 1000.0)
+        return self._body
+
+
+def _make_uploader_stub():
+    """Construit un UploaderService minimal sans dependances reseau,
+    suffisant pour appeler _capture_fansly_post_id() et _mark_published()."""
+    from fansly_bot.services.uploader import UploaderService
+
+    stub = UploaderService.__new__(UploaderService)  # bypass __init__
+    stub._run_id = 99
+    stub._capture_miss_streak = 0
+    return stub
+
+
+class TestCaptureFanslyPostId(unittest.IsolatedAsyncioTestCase):
+    """Verifie que _capture_fansly_post_id extrait correctement l'ID
+    sous les differents formats de reponse JSON de l'API Fansly,
+    et qu'il respecte le premier-gagne / les redacts PII."""
+
+    async def test_format_object_response(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"success": true, "response": {"id": "789012345", "x": 1}}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "789012345")
+
+    async def test_format_array_response(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"success": true, "response": [{"id": "111", "y": 2}]}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "111")
+
+    async def test_format_root_id(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"id": "42"}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "42")
+
+    async def test_numeric_id_coerced_to_string(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"response": {"id": 555}}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "555")
+
+    async def test_fallback_when_response_block_has_no_id(self):
+        # Cas adversarial : response est un dict sans id, mais id est a
+        # la racine. Le fallback doit s'appliquer (non exclusif).
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"response": {"meta": "x"}, "id": "root-123"}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "root-123")
+
+    async def test_toplevel_list_response(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '[{"id": "list-7"}]'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "list-7")
+
+    async def test_first_wins_does_not_overwrite(self):
+        # Si captured["value"] est deja set, une 2e capture (autre 2xx
+        # ou tentative tenacity ulterieure) ne doit PAS ecraser.
+        stub = _make_uploader_stub()
+        captured: dict = {"value": "first-id"}
+        body = '{"response": {"id": "second-id"}}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertEqual(captured["value"], "first-id")
+
+    async def test_first_wins_under_concurrent_tasks(self):
+        # Cas adversarial reel : 2 tasks _capture_fansly_post_id en
+        # parallele (par ex. 2 reponses 2xx /api/v1/post pendant le
+        # meme upload). Les deux peuvent passer la garde initiale puis
+        # yield sur response.text(). Sans re-check ATOMIQUE avant
+        # l'ecriture, le dernier-a-finir ecrase le premier-a-ecrire.
+        # Verifie que c'est bien la task plus rapide (slow_ms=2) qui
+        # gagne, pas celle qui finit en dernier.
+        import asyncio as _aio
+
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        fast = _FakeResponse('{"response": {"id": "fast"}}', slow_ms=2)
+        slow = _FakeResponse('{"response": {"id": "slow"}}', slow_ms=40)
+        await _aio.gather(
+            stub._capture_fansly_post_id(fast, captured),
+            stub._capture_fansly_post_id(slow, captured),
+        )
+        self.assertEqual(captured["value"], "fast")
+
+    async def test_buffer_persists_across_attempts(self):
+        # Simule le retry tenacity : tentative 1 capture l'ID, tentative
+        # 2 (re-entree dans _do_upload) ne doit PAS ecraser car captured
+        # est cree UNE SEULE FOIS dans publish_next, hors de la boucle.
+        # Premier-gagne strict valide cross-attempt.
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        await stub._capture_fansly_post_id(
+            _FakeResponse('{"response": {"id": "attempt1-id"}}'), captured,
+        )
+        self.assertEqual(captured["value"], "attempt1-id")
+        # Tentative 2 : si Fansly avait re-emis un 2xx avec un autre ID
+        # (par ex. doublon cote serveur), il ne doit PAS ecraser le 1er.
+        await stub._capture_fansly_post_id(
+            _FakeResponse('{"response": {"id": "attempt2-id"}}'), captured,
+        )
+        self.assertEqual(captured["value"], "attempt1-id")
+
+    async def test_missing_id_leaves_buffer_none(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        body = '{"success": false, "error": "rejected"}'
+        await stub._capture_fansly_post_id(_FakeResponse(body), captured)
+        self.assertIsNone(captured["value"])
+
+    async def test_miss_streak_increments_then_resets_on_success(self):
+        stub = _make_uploader_stub()
+        # 3 echecs consecutifs → streak = 3 (et log.error en interne)
+        for _ in range(3):
+            captured: dict = {"value": None}
+            await stub._capture_fansly_post_id(
+                _FakeResponse('{"unknown_shape": true}'), captured,
+            )
+        self.assertEqual(stub._capture_miss_streak, 3)
+        # Une capture reussie reset le streak a 0
+        captured = {"value": None}
+        await stub._capture_fansly_post_id(
+            _FakeResponse('{"response": {"id": "ok"}}'), captured,
+        )
+        self.assertEqual(stub._capture_miss_streak, 0)
+
+    async def test_invalid_json_does_not_raise(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        await stub._capture_fansly_post_id(_FakeResponse("not json {{{"), captured)
+        self.assertIsNone(captured["value"])
+
+    async def test_empty_body_does_not_raise(self):
+        stub = _make_uploader_stub()
+        captured: dict = {"value": None}
+        await stub._capture_fansly_post_id(_FakeResponse(""), captured)
+        self.assertIsNone(captured["value"])
+
+
+class TestIsPostCreationUrl(unittest.TestCase):
+    """Verifie que _is_post_creation_url filtre correctement les URLs :
+    seul POST /api/v1/post EXACT doit declencher la capture, pas les
+    sous-paths ni les prefixes accidentels."""
+
+    def test_accepts_exact_path(self):
+        from fansly_bot.services.uploader import UploaderService
+
+        for url in [
+            "https://apiv3.fansly.com/api/v1/post",
+            "https://apiv3.fansly.com/api/v1/post/",
+            "https://apiv3.fansly.com/api/v1/post?ngsw-bypass=true",
+            "https://apiv3.fansly.com/api/v1/post?foo=bar&baz=qux",
+        ]:
+            self.assertTrue(
+                UploaderService._is_post_creation_url(url), msg=url,
+            )
+
+    def test_rejects_action_subpaths(self):
+        from fansly_bot.services.uploader import UploaderService
+
+        for url in [
+            "https://apiv3.fansly.com/api/v1/post/12345",
+            "https://apiv3.fansly.com/api/v1/post/12345/like",
+            "https://apiv3.fansly.com/api/v1/post/12345/delete",
+            "https://apiv3.fansly.com/api/v1/post/12345/pin",
+        ]:
+            self.assertFalse(
+                UploaderService._is_post_creation_url(url), msg=url,
+            )
+
+    def test_rejects_accidental_prefixes(self):
+        from fansly_bot.services.uploader import UploaderService
+
+        for url in [
+            "https://apiv3.fansly.com/api/v1/repost",
+            "https://apiv3.fansly.com/api/v2/api/v1/post",
+            "https://apiv3.fansly.com/api/v1/post-comment",
+            "https://apiv3.fansly.com/post",
+        ]:
+            self.assertFalse(
+                UploaderService._is_post_creation_url(url), msg=url,
+            )
+
+    def test_handles_malformed_url(self):
+        from fansly_bot.services.uploader import UploaderService
+
+        # Pas censee throw, juste retourner False sur des entrees bizarres
+        self.assertFalse(UploaderService._is_post_creation_url(""))
+        self.assertFalse(UploaderService._is_post_creation_url("not-a-url"))
+
+
+class TestMarkPublishedPersistsFanslyId(_TmpStateMixin, unittest.TestCase):
+    """Verifie que _mark_published propage bien le fansly_post_id (recu en
+    parametre) a record_media_published, qui le persiste en BDD."""
+
+    def setUp(self):
+        super().setUp()
+        from fansly_bot.infra.state import StateStore
+
+        self.store = StateStore(self.settings)
+
+    def _stub_with_state(self):
+        from fansly_bot.services.uploader import UploaderService
+
+        stub = UploaderService.__new__(UploaderService)
+        stub._run_id = 77
+        stub._capture_miss_streak = 0
+        stub._state = self.store
+        return stub
+
+    def test_persists_id_when_captured(self):
+        stub = self._stub_with_state()
+        media = Path("IMG_0001.mp4")
+        stub._mark_published(
+            media, "caption #fyp", batch_name="B", cycle=2,
+            fansly_post_id="abc123",
+        )
+
+        conn = sqlite3.connect(str(self.settings.paths.state_db))
+        row = conn.execute(
+            "SELECT fansly_post_id FROM media_published "
+            "WHERE run_id=77 AND media_filename='IMG_0001.mp4'"
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "abc123")
+
+    def test_persists_null_when_not_captured(self):
+        stub = self._stub_with_state()
+        media = Path("IMG_0002.mp4")
+        stub._mark_published(
+            media, "caption #fyp", batch_name="B", cycle=2,
+            fansly_post_id=None,
+        )
+
+        conn = sqlite3.connect(str(self.settings.paths.state_db))
+        row = conn.execute(
+            "SELECT fansly_post_id FROM media_published "
+            "WHERE run_id=77 AND media_filename='IMG_0002.mp4'"
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+
+
 # =================== entry point ===================
 
 if __name__ == "__main__":
