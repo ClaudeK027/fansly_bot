@@ -150,41 +150,32 @@ class PurgerService:
         *,
         page: "Page",
         cancel_check=None,
-        scroll_cap: int | None = None,
         require_fyp: bool = True,
     ) -> dict:
-        """Supprime UN post specifique identifie par son ID Fansly officiel
-        (celui retourne par POST /api/v1/post et persiste en BDD via
-        record_media_published.fansly_post_id).
+        """Supprime UN post specifique identifie par son ID Fansly officiel.
 
-        Utilise par CycleRotator pour la rotation per-media : APRES avoir
-        republie un media au cycle N+1, on supprime sa version du cycle N.
+        STRATEGIE : navigation directe vers le permalien du post
+        (https://fansly.com/post/<fansly_post_id>) plutot que scroll
+        du feed profil. Raison : le DOM Fansly du profil ne contient ni
+        href avec l'ID du post ni attribut data-* avec cet ID — le
+        matching y est impossible. Le permalien est le seul point
+        d'identification fiable (et infiniment plus rapide qu'un scroll).
 
-        IMPORTANT — gestion du verrou session :
+        IMPORTANT — verrou session :
         L'appelant DOIT deja detenir la session (avoir ouvert
-        `async with self._session.use():`) et nous passer la `page` qu'il
-        a recuperee. Cette methode NE re-acquiert PAS la session — sinon
-        l'asyncio.Lock non-reentrant de BrowserSession deadlockerait
-        immediatement. Cette contrainte est verifiee par le caller
-        (UploaderService.publish_next).
+        `async with self._session.use():`) et nous passer la `page`.
+        Sans ca, deadlock sur asyncio.Lock non-reentrant.
 
         GARDE-FOU `require_fyp` :
-        Si True (default), apres relocalisation du post on lit sa caption
-        et on EXIGE qu'elle contienne '#fyp' (signature systematique du
-        bot, cf. CycleCleaner). Si la caption ne contient pas '#fyp', on
-        ABORT le delete avec status='guard_fyp' + log critical — defense
-        en profondeur contre un faux positif de capture Phase A qui
-        pointerait vers un post manuel du createur.
-
-        `scroll_cap` :
-        Si None, utilise self._settings.purge.scroll_safety_cap. Sinon
-        utilise la valeur passee (ex. publishing.rotation_scroll_safety_cap
-        pour decoupler la rotation de la purge classique).
+        Si True (default), avant le delete on lit la caption affichee
+        sur la page du post et on EXIGE qu'elle contienne '#fyp'
+        (signature systematique du bot). Si absent, on ABORT le delete
+        avec status='guard_fyp' + log critical — defense en profondeur
+        contre un faux positif de capture Phase A.
 
         Retour : dict avec :
           - status : 'deleted' | 'not_found' | 'cancelled' | 'failed' | 'guard_fyp'
           - fansly_post_id : echo du parametre
-          - examined : nombre d'items DOM examines
           - error : str si status='failed'
         """
         if cancel_check is not None:
@@ -194,140 +185,89 @@ class PurgerService:
             return {
                 "status": "failed",
                 "fansly_post_id": fansly_post_id,
-                "examined": 0,
                 "error": "empty_fansly_post_id",
             }
+        if self._cancel_check():
+            return {"status": "cancelled", "fansly_post_id": target_id}
 
-        cap = scroll_cap if scroll_cap is not None else self._settings.purge.scroll_safety_cap
-
-        # La page est fournie par l'appelant (session deja acquise) — on
-        # navigue vers le profil mais on ne re-acquiert PAS le verrou.
+        # 1) Navigation directe au permalien du post.
+        url = self._settings.auth.base_url.rstrip("/") + f"/post/{target_id}"
+        log.info("rotator_navigating_permalink", url=url)
         try:
-            await self._goto_profile(page)
+            await page.goto(url, wait_until="domcontentloaded")
         except Exception as e:  # noqa: BLE001
-            log.error("rotator_navigation_failed", error=str(e), exc_info=True)
+            log.error(
+                "rotator_navigation_failed",
+                fansly_post_id=target_id, error=str(e),
+            )
             return {
                 "status": "failed", "fansly_post_id": target_id,
-                "examined": 0, "error": f"nav:{e}",
+                "error": f"nav:{type(e).__name__}",
             }
+        await self._humanizer.short_pause()
+        await self._dismiss_overlays(page)
 
-        return await self._scan_and_delete(
-            page, target_id, cap=cap, require_fyp=require_fyp,
-        )
+        # 2) Localiser le post sur la page solo. Sur le permalien, il y
+        # a au moins un <app-post.feed-item> qui represente le post.
+        # Si le post n'existe pas (deleted/forbidden), le DOM Angular ne
+        # rendra pas d'app-post — on detecte ca via timeout court.
+        items = Sel.feed_items(page)
+        try:
+            await items.first.wait_for(state="visible", timeout=8000)
+        except PWTimeout:
+            log.warning(
+                "rotator_post_not_found",
+                fansly_post_id=target_id,
+                hint="permalink page rendered no app-post (deleted or 404)",
+            )
+            return {"status": "not_found", "fansly_post_id": target_id}
 
-    async def _scan_and_delete(
-        self, page: "Page", target_id: str, *, cap: int, require_fyp: bool,
-    ) -> dict:
-        """Coeur de delete_post_by_fansly_id : scrolle le feed du profil
-        en cherchant le post cible, applique le garde-fou #fyp si
-        require_fyp=True, supprime via _delete_one."""
-        last_height = 0
-        stagnant_scrolls = 0
-        examined_total = 0
+        if self._cancel_check():
+            return {"status": "cancelled", "fansly_post_id": target_id}
 
-        while examined_total < cap:
-            if self._cancel_check():
-                log.info("rotator_cancelled", fansly_post_id=target_id)
-                return {
-                    "status": "cancelled",
-                    "fansly_post_id": target_id,
-                    "examined": examined_total,
-                }
+        item = items.first
+        log.info("rotator_target_found", fansly_post_id=target_id)
 
-            item = await self._relocate_by_fansly_id(page, target_id)
-            if item is not None:
-                log.info(
-                    "rotator_target_found",
-                    fansly_post_id=target_id, examined=examined_total,
+        # 3) Garde-fou #fyp : on n'efface QUE si la caption confirme que
+        # c'est bien un post du bot.
+        if require_fyp:
+            try:
+                caption = await self._extract_caption(item)
+            except Exception:  # noqa: BLE001
+                caption = ""
+            caption_norm = _normalize(caption)
+            if "#fyp" not in caption_norm:
+                log.critical(
+                    "rotator_guard_fyp_blocked",
+                    fansly_post_id=target_id,
+                    caption_excerpt=caption[:80],
+                    hint="post lacks #fyp signature; refusing to delete",
                 )
+                await self._dump_artifact(
+                    f"rotator_guard_blocked_{_safe(target_id)}"
+                )
+                return {"status": "guard_fyp", "fansly_post_id": target_id}
 
-                # Garde-fou : on n'effectue le delete que si la caption
-                # du post cible contient #fyp (signature bot). Protege
-                # contre un faux positif de capture Phase A qui pointerait
-                # vers un post manuel du createur.
-                if require_fyp:
-                    try:
-                        caption = await self._extract_caption(item)
-                    except Exception:  # noqa: BLE001
-                        caption = ""
-                    caption_norm = _normalize(caption)
-                    if "#fyp" not in caption_norm:
-                        log.critical(
-                            "rotator_guard_fyp_blocked",
-                            fansly_post_id=target_id,
-                            caption_excerpt=caption[:80],
-                            hint="post lacks #fyp signature; refusing to delete",
-                        )
-                        await self._dump_artifact(
-                            f"rotator_guard_blocked_{_safe(target_id)}"
-                        )
-                        return {
-                            "status": "guard_fyp",
-                            "fansly_post_id": target_id,
-                            "examined": examined_total,
-                        }
-
-                try:
-                    async for attempt in self._retries.network():
-                        with attempt:
-                            await self._delete_one(page, item)
-                    log.info("rotator_post_deleted", fansly_post_id=target_id)
-                    return {
-                        "status": "deleted",
-                        "fansly_post_id": target_id,
-                        "examined": examined_total,
-                    }
-                except Exception as e:  # noqa: BLE001
-                    log.error(
-                        "rotator_delete_failed",
-                        fansly_post_id=target_id,
-                        error=str(e), exc_info=True,
-                    )
-                    await self._dump_artifact(
-                        f"rotator_delete_failed_{_safe(target_id)}"
-                    )
-                    return {
-                        "status": "failed",
-                        "fansly_post_id": target_id,
-                        "examined": examined_total,
-                        "error": f"delete:{type(e).__name__}",
-                    }
-
-            try:
-                items = Sel.feed_items(page)
-                examined_total = await items.count()
-            except Exception:  # noqa: BLE001
-                pass
-
-            await self._humanizer.scroll_human(page, direction="down")
-            await self._humanizer.short_pause()
-            try:
-                new_height = await page.evaluate("document.body.scrollHeight")
-            except Exception:  # noqa: BLE001
-                new_height = last_height
-            if new_height == last_height:
-                stagnant_scrolls += 1
-                if stagnant_scrolls >= 2:
-                    log.info(
-                        "rotator_feed_bottom_reached",
-                        fansly_post_id=target_id, examined=examined_total,
-                    )
-                    break
-            else:
-                stagnant_scrolls = 0
-                last_height = new_height
-
-        log.warning(
-            "rotator_post_not_found",
-            fansly_post_id=target_id,
-            examined=examined_total,
-            scroll_cap_hit=(examined_total >= cap),
-        )
-        return {
-            "status": "not_found",
-            "fansly_post_id": target_id,
-            "examined": examined_total,
-        }
+        # 4) Suppression UI (menu options -> Delete Post -> Confirm).
+        try:
+            async for attempt in self._retries.network():
+                with attempt:
+                    await self._delete_one(page, item)
+            log.info("rotator_post_deleted", fansly_post_id=target_id)
+            return {"status": "deleted", "fansly_post_id": target_id}
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "rotator_delete_failed",
+                fansly_post_id=target_id, error=str(e),
+            )
+            await self._dump_artifact(
+                f"rotator_delete_failed_{_safe(target_id)}"
+            )
+            return {
+                "status": "failed",
+                "fansly_post_id": target_id,
+                "error": f"delete:{type(e).__name__}",
+            }
 
     # ---------- navigation profil ----------
 
@@ -827,56 +767,6 @@ class PurgerService:
                     digest = hashlib.sha1(html.encode("utf-8", errors="ignore")).hexdigest()[:16]
                     if digest == value:
                         return it
-            except Exception:  # noqa: BLE001
-                continue
-        return None
-
-    async def _relocate_by_fansly_id(
-        self, page: Page, fansly_id: str,
-    ) -> Optional[Locator]:
-        """Cherche un feed item dont l'ID Fansly correspond, en essayant
-        plusieurs strategies de matching dans l'ordre :
-          1. Attributs DOM : data-feed-item-id, data-post-id, data-id, id
-             (le fansly_post_id capture par l'API correspond TYPIQUEMENT
-             a l'un de ces attributs).
-          2. Permalien : a[href*='/post/'] avec match strict du segment.
-
-        Plus robuste que _relocate_by_id('href:<id>') qui forcait la
-        branche href seule — le cleaner batch trouvait deja les posts
-        via les attributs DOM, on suit la meme strategie ici.
-
-        Logue l'attribut qui a permis le match pour observabilite.
-        """
-        items = Sel.feed_items(page)
-        count = await items.count()
-        attrs_to_try = ("data-feed-item-id", "data-post-id", "data-id", "id")
-        for i in range(count):
-            it = items.nth(i)
-            try:
-                # 1) Essai par attribut DOM
-                for attr in attrs_to_try:
-                    try:
-                        v = await it.get_attribute(attr, timeout=500)
-                    except Exception:  # noqa: BLE001
-                        v = None
-                    if v and v.strip() == fansly_id:
-                        log.debug(
-                            "rotator_match_via_attr",
-                            attr=attr, fansly_id=fansly_id,
-                        )
-                        return it
-                # 2) Fallback par permalien (match strict du segment)
-                link = it.locator("a[href*='/post/']").first
-                if await link.count() > 0:
-                    href = await link.get_attribute("href", timeout=500)
-                    if href:
-                        m = re.search(r"/post/([^/?#]+)", href)
-                        if m and m.group(1) == fansly_id:
-                            log.debug(
-                                "rotator_match_via_href",
-                                fansly_id=fansly_id,
-                            )
-                            return it
             except Exception:  # noqa: BLE001
                 continue
         return None

@@ -152,15 +152,15 @@ class CycleRotator:
             media=media_filename, cycle=current_cycle,
         )
 
-        # Plafond de scroll dedie rotation (decouple de purge).
-        rotation_cap = self._settings.publishing.rotation_scroll_safety_cap
-
+        # Strategie : navigation directe au permalien Fansly du post.
+        # Pas de scroll feed (le DOM Fansly du profil n'a ni href post
+        # ni attribut data-* avec l'ID post — match impossible par cette
+        # voie). Le permalien est l'unique point d'identification fiable.
         try:
             result = await self._purger.delete_post_by_fansly_id(
                 fansly_id,
                 page=page,
                 cancel_check=cancel_check,
-                scroll_cap=rotation_cap,
                 require_fyp=True,
             )
         except Exception as e:  # noqa: BLE001
