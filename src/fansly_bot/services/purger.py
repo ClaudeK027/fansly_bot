@@ -234,7 +234,7 @@ class PurgerService:
                     "examined": examined_total,
                 }
 
-            item = await self._relocate_by_id(page, f"href:{target_id}")
+            item = await self._relocate_by_fansly_id(page, target_id)
             if item is not None:
                 log.info(
                     "rotator_target_found",
@@ -827,6 +827,56 @@ class PurgerService:
                     digest = hashlib.sha1(html.encode("utf-8", errors="ignore")).hexdigest()[:16]
                     if digest == value:
                         return it
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    async def _relocate_by_fansly_id(
+        self, page: Page, fansly_id: str,
+    ) -> Optional[Locator]:
+        """Cherche un feed item dont l'ID Fansly correspond, en essayant
+        plusieurs strategies de matching dans l'ordre :
+          1. Attributs DOM : data-feed-item-id, data-post-id, data-id, id
+             (le fansly_post_id capture par l'API correspond TYPIQUEMENT
+             a l'un de ces attributs).
+          2. Permalien : a[href*='/post/'] avec match strict du segment.
+
+        Plus robuste que _relocate_by_id('href:<id>') qui forcait la
+        branche href seule — le cleaner batch trouvait deja les posts
+        via les attributs DOM, on suit la meme strategie ici.
+
+        Logue l'attribut qui a permis le match pour observabilite.
+        """
+        items = Sel.feed_items(page)
+        count = await items.count()
+        attrs_to_try = ("data-feed-item-id", "data-post-id", "data-id", "id")
+        for i in range(count):
+            it = items.nth(i)
+            try:
+                # 1) Essai par attribut DOM
+                for attr in attrs_to_try:
+                    try:
+                        v = await it.get_attribute(attr, timeout=500)
+                    except Exception:  # noqa: BLE001
+                        v = None
+                    if v and v.strip() == fansly_id:
+                        log.debug(
+                            "rotator_match_via_attr",
+                            attr=attr, fansly_id=fansly_id,
+                        )
+                        return it
+                # 2) Fallback par permalien (match strict du segment)
+                link = it.locator("a[href*='/post/']").first
+                if await link.count() > 0:
+                    href = await link.get_attribute("href", timeout=500)
+                    if href:
+                        m = re.search(r"/post/([^/?#]+)", href)
+                        if m and m.group(1) == fansly_id:
+                            log.debug(
+                                "rotator_match_via_href",
+                                fansly_id=fansly_id,
+                            )
+                            return it
             except Exception:  # noqa: BLE001
                 continue
         return None
