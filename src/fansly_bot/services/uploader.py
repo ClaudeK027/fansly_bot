@@ -71,8 +71,8 @@ class UploaderService:
         self._capture_miss_streak: int = 0
         # Service de rotation per-media. Si non-None (mode
         # publishing.cycle_cleanup_mode='per_media' du worker), on
-        # invoque rotate_after_publish() APRES chaque publication reussie
-        # pour supprimer la version precedente du meme media. Si None
+        # invoque rotate_before_publish() AVANT chaque publication pour
+        # supprimer la version precedente du meme media. Si None
         # (mode 'batch' historique), aucune rotation per-media.
         self._cycle_rotator = cycle_rotator
         # Closure d'annulation propagee par le worker
@@ -217,6 +217,35 @@ class UploaderService:
             try:
                 await self._auth.ensure_logged_in()
 
+                # Rotation AVANT publication : on supprime la version
+                # precedente du media (publiee dans un cycle anterieur)
+                # AVANT de publier la nouvelle. C'est le comportement
+                # metier demande : "lorsqu'il choisit de poster un nouveau
+                # media, qu'il le supprime avant". On passe la PAGE deja
+                # recuperee dans le contexte `async with self._session.use()`
+                # du publish_next pour eviter le deadlock (asyncio.Lock
+                # non-reentrant). NE LEVE pas — toute erreur degrade en
+                # log : on continue vers la publication meme si la
+                # rotation a echoue (au pire on aura un doublon visible,
+                # rattrape au cycle suivant).
+                if self._cycle_rotator is not None:
+                    try:
+                        page = await self._session.page()
+                        rot_result = await self._cycle_rotator.rotate_before_publish(
+                            page=page,
+                            run_id=self._run_id,
+                            batch_name=batch.name,
+                            current_cycle=batch.current_cycle,
+                            media_filename=media.name,
+                            cancel_check=self._cancel_check,
+                        )
+                        log.info("uploader_rotation_result", **rot_result)
+                    except Exception as e:  # noqa: BLE001
+                        log.error(
+                            "uploader_rotation_exception",
+                            error=type(e).__name__, media=media.name,
+                        )
+
                 # Retry tenacity sur tout le upload : robustesse face aux
                 # timings cote Fansly (encodage video, latence reseau, etc.).
                 # Si le 1er essai echoue, on relance toute la sequence et
@@ -235,33 +264,6 @@ class UploaderService:
                     batch=batch.name,
                     cycle=batch.current_cycle,
                 )
-
-                # Rotation APRES publication reussie (Blocker 2 du review v1) :
-                # on supprime l'ancienne version du media seulement si le
-                # nouveau post a bien ete cree. Si la publication echoue,
-                # l'ancien post reste en place (pas de fenetre de visibilite
-                # vide). On passe la PAGE deja recuperee dans le contexte
-                # `async with self._session.use()` du publish_next pour
-                # eviter le deadlock (asyncio.Lock non-reentrant).
-                if self._cycle_rotator is not None:
-                    try:
-                        page = await self._session.page()
-                        rot_result = await self._cycle_rotator.rotate_after_publish(
-                            page=page,
-                            run_id=self._run_id,
-                            batch_name=batch.name,
-                            current_cycle=batch.current_cycle,
-                            media_filename=media.name,
-                            cancel_check=self._cancel_check,
-                        )
-                        log.info("uploader_rotation_result", **rot_result)
-                    except Exception as e:  # noqa: BLE001
-                        # Rotation echouee : on log mais on n'echoue pas la
-                        # publication (deja confirmee en BDD via _mark_published).
-                        log.error(
-                            "uploader_rotation_exception",
-                            error=type(e).__name__, media=media.name,
-                        )
 
                 return media.name
 

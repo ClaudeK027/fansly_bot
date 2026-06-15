@@ -63,7 +63,7 @@ class CycleRotator:
             settings, session, humanizer, auth, state, retries,
         )
 
-    async def rotate_after_publish(
+    async def rotate_before_publish(
         self,
         *,
         page: "Page",
@@ -73,12 +73,13 @@ class CycleRotator:
         media_filename: str,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict:
-        """Apres une publication reussie au cycle N+1, supprime la version
-        precedente du meme media (capturee en cycle <= N) si elle existe.
+        """AVANT de publier un media au cycle N+1, supprime sa version
+        precedente (publiee en cycle <= N) si elle existe.
 
-        Appele APRES _mark_published (pas avant) pour ne JAMAIS creer de
-        fenetre de visibilite vide : si la publication echoue, l'ancien
-        post reste en place ; si elle reussit, on rote.
+        Comportement metier demande : "lorsqu'il choisit de poster un
+        nouveau media, qu'il le supprime avant". On rote d'abord, on
+        publie ensuite. Si la publication echoue par la suite, l'ancien
+        post sera deja supprime (compromis assume).
 
         `page` est fournie par l'appelant (uploader, dans un contexte
         `async with self._session.use()`). On NE re-acquiert PAS la

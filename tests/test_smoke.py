@@ -823,7 +823,7 @@ class TestCycleRotator(unittest.IsolatedAsyncioTestCase):
         rot = self._make_rotator(_FakeStateForRotator())
         # page=None passe ok car les branches first_cycle_skip
         # /no_previous_id /db_error ne touchent jamais la page.
-        result = await rot.rotate_after_publish(
+        result = await rot.rotate_before_publish(
             page=None, run_id=1, batch_name="B",
             current_cycle=1, media_filename="m.jpg",
         )
@@ -832,7 +832,7 @@ class TestCycleRotator(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_previous_id_skipped(self):
         rot = self._make_rotator(_FakeStateForRotator(lookup_result=None))
-        result = await rot.rotate_after_publish(
+        result = await rot.rotate_before_publish(
             page=None, run_id=1, batch_name="B",
             current_cycle=3, media_filename="m.jpg",
         )
@@ -840,7 +840,7 @@ class TestCycleRotator(unittest.IsolatedAsyncioTestCase):
 
     async def test_db_error_does_not_raise(self):
         rot = self._make_rotator(_FakeStateForRotator(raise_on_lookup=True))
-        result = await rot.rotate_after_publish(
+        result = await rot.rotate_before_publish(
             page=None, run_id=1, batch_name="B",
             current_cycle=3, media_filename="m.jpg",
         )
