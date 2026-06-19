@@ -378,8 +378,14 @@ class Worker:
             except AuthError as e:
                 raise RuntimeError(f"Auth invalide : {e}") from e
 
+            iteration = 0
             while True:
                 self._raise_if_cancelled(job.id)
+                iteration += 1
+                # Log de borne d'iteration : sert a localiser un hang dans
+                # la boucle (avant ce fix, un hang entre publish_waiting_next
+                # et l'iteration suivante etait quasi-invisible).
+                log.info("publish_iter_begin", job_id=job.id, iteration=iteration)
 
                 # 1) ETAPE BDD-ONLY : decider si on avance le cycle / on stoppe
                 batch_before = self._state.get_active_batch()
@@ -430,7 +436,29 @@ class Worker:
                     break
 
                 # 4) Publication d'un media du cycle courant
-                published = await uploader.publish_next()
+                # FAILSAFE ULTIME : wrapper publish_next() dans un asyncio.wait_for
+                # global (10 min cap). Sans ca, un hang sur un appel Playwright
+                # non-borne (CDP gele, renderer zombie) pouvait bloquer le
+                # worker indefiniment — observe sur job 49 (2h en epoll_wait).
+                # Sur timeout : recycle la session (stop+start) pour repartir
+                # sur un Chromium frais, puis on continue la boucle.
+                try:
+                    published = await asyncio.wait_for(
+                        uploader.publish_next(), timeout=600.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "publish_next_failsafe_timeout",
+                        job_id=job.id, iteration=iteration,
+                        hint="publish_next hung >10min ; recycling session",
+                    )
+                    # Recycle preventif de la session pour repartir propre
+                    with suppress(Exception):
+                        await session.stop()
+                    with suppress(Exception):
+                        await session.start()
+                    await self._sleep_cancellable(30, job.id)
+                    continue
 
                 # Si stop_batch() a ete declenche par publish_next (max_cycles)
                 if self._state.get_active_batch() is None:

@@ -179,7 +179,11 @@ class UploaderService:
         tentatives tenacity de cette publication (premier-gagne strict :
         une fois l'ID capte, les retries ne l'ecrasent pas).
         """
+        # Log observabilite : si on hang ici, on saura que c'est sur
+        # l'acquisition du _use_lock (un autre service tient la session).
+        log.info("publish_next_acquiring_lock")
         async with self._session.use():
+            log.info("publish_next_lock_acquired")
             batch = self._state.get_active_batch()
             if batch is None:
                 log.info("uploader_no_active_batch")
@@ -399,11 +403,14 @@ class UploaderService:
             # Drain : on attend les tasks en vol AVANT de retourner. Sans
             # ca, la task qui parse POST /api/v1/post peut ecrire dans
             # captured APRES que publish_next ait deja lu None.
+            # Timeout 12s : couvre le pire cas 5s+5s chaines (response.text
+            # dans _log_response puis dans _capture_fansly_post_id) avec
+            # une marge de 2s pour la coordination asyncio.
             if pending_tasks:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*pending_tasks, return_exceptions=True),
-                        timeout=8.0,
+                        timeout=12.0,
                     )
                 except asyncio.TimeoutError:
                     # Timeout : on ne laisse PAS les tasks en vol — sinon

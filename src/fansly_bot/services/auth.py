@@ -14,6 +14,7 @@ Approche :
 from __future__ import annotations
 
 import asyncio
+import time
 
 import structlog
 from playwright.async_api import TimeoutError as PWTimeout
@@ -35,6 +36,12 @@ class AuthService:
         self._settings = settings
         self._session = session
         self._humanizer = humanizer
+        # Timestamp monotonique du dernier check session reussi. Sert au cache
+        # de ensure_logged_in() : on ne refait pas un page.goto(/home) a chaque
+        # publication, on le fait au plus une fois par session_check_interval_minutes.
+        # Avant ce fix, ensure_logged_in etait appele a CHAQUE publish_next() —
+        # explosion de la surface d'exposition au hang sur SPA Angular zombie.
+        self._last_check_monotonic: float = 0.0
 
     @property
     def _home_url(self) -> str:
@@ -46,13 +53,43 @@ class AuthService:
 
     # ---------- verification rapide ----------
 
-    async def ensure_logged_in(self) -> None:
-        """Verifie la session ; leve AuthError si on est rejete sur /login."""
+    async def ensure_logged_in(self, *, force: bool = False) -> None:
+        """Verifie la session ; leve AuthError si on est rejete sur /login.
+
+        CACHE : sauf si force=True, on skip le check si le dernier verif a
+        moins de `session_check_interval_minutes` (config.yaml, default 60min).
+        Sans ce cache, ensure_logged_in() faisait un page.goto(/home) a CHAQUE
+        publish_next() — explosion de la surface au hang sur SPA Angular zombie.
+
+        DEFENSE EN PROFONDEUR : le page.goto est wrappe dans asyncio.wait_for
+        applicatif, en plus du navigation_timeout Playwright. Sur un transport
+        CDP gele (renderer zombie), le timeout Playwright peut ne pas se
+        declencher car son comptage depend du CDP lui-meme. Notre wait_for
+        externe coupe quoi qu'il arrive.
+        """
+        # Cache : skip si dernier check assez recent
+        interval_s = self._settings.auth.session_check_interval_minutes * 60
+        now = time.monotonic()
+        if not force and (now - self._last_check_monotonic) < interval_s:
+            log.debug(
+                "auth_check_cached_skip",
+                last_check_age_s=round(now - self._last_check_monotonic, 1),
+                interval_s=interval_s,
+            )
+            return
+
         page = await self._session.page()
         log.info("auth_check_starting", url=self._home_url)
+        # navigation_timeout_ms est applique par Playwright (default 30s) ; on
+        # ajoute 5s de marge et un wait_for asyncio externe au cas ou Playwright
+        # ne respecterait pas le timeout (CDP gele).
+        nav_timeout_s = self._settings.browser.navigation_timeout_ms / 1000.0
         try:
-            await page.goto(self._home_url, wait_until="domcontentloaded")
-        except PWTimeout:
+            await asyncio.wait_for(
+                page.goto(self._home_url, wait_until="domcontentloaded"),
+                timeout=nav_timeout_s + 5.0,
+            )
+        except (PWTimeout, asyncio.TimeoutError):
             raise AuthError("Navigation vers /home a expire")
 
         await self._humanizer.short_pause()
@@ -65,6 +102,8 @@ class AuthService:
                 "Session Fansly absente ou expiree. Lance "
                 "`python -m fansly_bot setup-auth` une fois pour t'authentifier."
             )
+        # Mise a jour du cache : prochain skip pendant interval_s
+        self._last_check_monotonic = time.monotonic()
         log.info("auth_session_ok", url=current)
 
     # ---------- premier login interactif ----------

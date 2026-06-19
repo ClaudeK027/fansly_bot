@@ -102,7 +102,20 @@ class BrowserSession:
         if self._context is None:
             raise RuntimeError("BrowserSession non demarree.")
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            # IMPORTANT : context.new_page() N'HERITE PAS de
+            # set_default_navigation_timeout / set_default_timeout — ces
+            # defaults ne couvrent que page.goto et locator.*. Sans wrapper
+            # asyncio.wait_for, new_page() peut hang indefiniment si le
+            # transport CDP est gele (renderer Chromium zombie).
+            try:
+                self._page = await asyncio.wait_for(
+                    self._context.new_page(), timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                log.error("session_new_page_timeout", hint="Chromium renderer may be zombie")
+                raise RuntimeError(
+                    "context.new_page() a timeout (10s) — session probablement corrompue"
+                )
         return self._page
 
     @property
@@ -122,12 +135,21 @@ class BrowserSession:
         return self._use_lock
 
     async def is_alive(self) -> bool:
+        """Healthcheck rapide : verifie que le renderer Chromium repond.
+
+        Wrappe page.evaluate dans asyncio.wait_for car evaluate() N'HERITE PAS
+        des defaults Playwright (set_default_timeout ne couvre que les
+        locator.*/wait_for). Sans ce timeout, is_alive() peut elle-meme hang
+        indefiniment sur un renderer zombie."""
         if self._context is None:
             return False
         try:
             page = await self.page()
-            await page.evaluate("1+1")
+            await asyncio.wait_for(page.evaluate("1+1"), timeout=5.0)
             return True
+        except asyncio.TimeoutError:
+            log.warning("session_healthcheck_timeout", hint="renderer Chromium unresponsive")
+            return False
         except Exception as e:  # noqa: BLE001
             log.warning("session_healthcheck_failed", error=str(e))
             return False

@@ -178,6 +178,13 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # busy_timeout=5000 : si une autre connexion (UI Streamlit, autre
+        # processus) detient un write lock sur le WAL, SQLite attend jusqu'a
+        # 5s pour acquerir le lock plutot que de retourner immediatement
+        # SQLITE_BUSY. Avant ce fix, busy_timeout=0 par defaut pouvait causer
+        # un blocage indefini sur lock contention (worker en epoll_wait pendant
+        # 2h+ apres publish_waiting_next, audit hang job 49).
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._lock = asyncio.Lock()
         self._init_schema()
         log.info("state_store_ready", path=str(self._path))

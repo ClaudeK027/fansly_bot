@@ -916,6 +916,89 @@ class TestPublishingCycleCleanupMode(unittest.TestCase):
             )
 
 
+# =================== Phase 0 : fix worker hang ===================
+
+
+class TestSQLiteBusyTimeout(_TmpStateMixin, unittest.TestCase):
+    """Verifie que PRAGMA busy_timeout=5000 est actif sur la connexion
+    StateStore. Avant le fix worker hang : busy_timeout=0 (default) =
+    blocage indefini sur lock contention WAL avec UI Streamlit."""
+
+    def test_busy_timeout_is_5000ms(self):
+        from fansly_bot.infra.state import StateStore
+
+        self.store = StateStore(self.settings)
+        cur = self.store._conn.execute("PRAGMA busy_timeout")
+        value = cur.fetchone()[0]
+        self.assertEqual(
+            value, 5000,
+            f"PRAGMA busy_timeout doit etre 5000ms, got {value}ms",
+        )
+
+
+class TestAuthSessionCheckCache(unittest.IsolatedAsyncioTestCase):
+    """Verifie que ensure_logged_in() utilise un cache base sur
+    session_check_interval_minutes. Avant ce fix, ensure_logged_in faisait
+    un page.goto(/home) a chaque publish_next() — explosion de la surface
+    de hang sur SPA Angular zombie (job 49)."""
+
+    def _make_auth(self, interval_minutes: float = 60):
+        from fansly_bot.services.auth import AuthService
+
+        # Stub Settings minimal avec les seuls champs lus par ensure_logged_in
+        class _Auth:
+            base_url = "https://fansly.com"
+            home_path = "/home"
+            session_check_interval_minutes = interval_minutes
+
+        class _Browser:
+            navigation_timeout_ms = 30000
+
+        class _Settings:
+            auth = _Auth()
+            browser = _Browser()
+
+        svc = AuthService.__new__(AuthService)  # bypass __init__
+        svc._settings = _Settings()
+        svc._session = None
+        svc._humanizer = None
+        svc._last_check_monotonic = 0.0
+        return svc
+
+    async def test_second_call_within_interval_is_skipped(self):
+        # Premier appel : on simule un check reussi en settant manuellement
+        # le timestamp comme si la 1ere goto venait juste de reussir.
+        import time as _time
+
+        svc = self._make_auth(interval_minutes=60)
+        svc._last_check_monotonic = _time.monotonic()
+        # Le 2e appel doit skip et NE PAS toucher au session (qui est None
+        # donc planterait si appele). Si ca passe sans exception : cache OK.
+        await svc.ensure_logged_in()
+        # Toujours dans la fenetre de cache
+        self.assertGreater(svc._last_check_monotonic, 0.0)
+
+    async def test_force_bypasses_cache(self):
+        # Avec force=True, le check est tente meme dans la fenetre de cache.
+        # Comme svc._session est None, page() levera AttributeError -> on
+        # capture pour confirmer qu'on a bien essaye d'aller au-dela du cache.
+        import time as _time
+
+        svc = self._make_auth(interval_minutes=60)
+        svc._last_check_monotonic = _time.monotonic()
+        with self.assertRaises(AttributeError):
+            await svc.ensure_logged_in(force=True)
+
+    async def test_zero_interval_disables_cache(self):
+        # interval=0 -> le check est tente a chaque appel (utile pour debug).
+        import time as _time
+
+        svc = self._make_auth(interval_minutes=0)
+        svc._last_check_monotonic = _time.monotonic()
+        with self.assertRaises(AttributeError):
+            await svc.ensure_logged_in()
+
+
 # =================== entry point ===================
 
 if __name__ == "__main__":
