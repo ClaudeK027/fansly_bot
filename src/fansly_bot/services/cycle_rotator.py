@@ -1,21 +1,18 @@
 # src/fansly_bot/services/cycle_rotator.py
-"""Service orchestrateur de la rotation per-media.
+"""Service de rotation per-media : avant chaque publication, supprime
+la version precedente du meme media.
 
-Lorsque le mode publishing.cycle_cleanup_mode = 'per_media' est actif,
 AVANT chaque publication d'un media dans le cycle N+1, on cherche en
 BDD si ce meme media a deja ete publie dans un cycle anterieur du
 meme run/batch ; si oui ET si on a son fansly_post_id (capture Phase A),
 on supprime ce post precedent via PurgerService.delete_post_by_fansly_id().
-
-C'est l'inverse du CycleCleaner classique :
-  - CycleCleaner : suppression batch en fin de cycle N (avant cycle N+1)
-  - CycleRotator : suppression unitaire avant chaque publication du
-    cycle N+1 du media correspondant
+La suppression utilise le permalien direct Fansly (`/post/<id>`), pas
+de scroll du feed profil.
 
 Skip gracieux (jamais d'exception remontee a l'appelant) :
   - Premier cycle (current_cycle <= 1) : rien a supprimer
   - Filename absent des cycles precedents (nouveau media dans le pool)
-  - Cycle precedent existe mais sans fansly_post_id (capture Phase A ratee)
+  - Cycle precedent existe mais sans fansly_post_id (capture ratee)
   - Post Fansly deja supprime cote serveur (status 'not_found')
 """
 

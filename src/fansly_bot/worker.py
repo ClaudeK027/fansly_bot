@@ -36,7 +36,7 @@ from .infra.state import Job, StateStore
 from .logging_setup import setup_logging
 from .services.auth import AuthError, AuthService
 from .services.caption_picker import CaptionPicker
-from .services.cycle_cleaner import CycleCleaner
+from .services.cycle_rotator import CycleRotator
 from .services.purger import PurgerService
 from .services.uploader import UploaderService
 
@@ -324,27 +324,13 @@ class Worker:
                 raise RuntimeError(
                     f"Job {job.id} : captions_batch_name invalide ({e})"
                 ) from e
-        # Mode de nettoyage : 'batch' (default historique : CycleCleaner
-        # en bloc a la transition) ou 'per_media' (CycleRotator : suppression
-        # 1-pour-1 du media correspondant juste AVANT chaque publication).
-        cleanup_mode = custom_settings.publishing.cycle_cleanup_mode
-        log.info(
-            "publish_cleanup_mode_resolved",
-            cycle_cleanup_mode=cleanup_mode,
-            job_id=job.id,
+        # CycleRotator : seul mode de nettoyage. Avant chaque publication
+        # du cycle N+1, on supprime la version precedente du meme media
+        # via le permalien direct Fansly. Plus de cleanup batch en fin de
+        # cycle — la rotation se fait au cas par cas avant chaque republi.
+        rotator = CycleRotator(
+            custom_settings, session, humanizer, auth, self._state, retries,
         )
-
-        # Le CycleRotator n'est construit et injecte dans l'uploader que
-        # si le mode est 'per_media'. En 'batch' on garde le flow actuel
-        # inchange (uploader sans rotator = pas de pre-publish hook).
-        rotator = None
-        if cleanup_mode == "per_media":
-            from .services.cycle_rotator import CycleRotator
-
-            rotator = CycleRotator(
-                custom_settings, session, humanizer, auth, self._state, retries,
-            )
-
         uploader = UploaderService(
             custom_settings, session, humanizer, auth, captions, self._state, retries,
             captions_batch_name=captions_batch_name,
@@ -356,20 +342,6 @@ class Worker:
             log.info("publish_captions_batch", name=captions_batch_name)
         else:
             log.info("publish_captions_legacy_mode")
-        cleaner = CycleCleaner(
-            custom_settings, session, humanizer, auth, self._state, retries
-        )
-        # En mode 'per_media' on neutralise le cleanup batch en fin de cycle :
-        # la rotation se fait deja au cas par cas avant chaque publication.
-        # En mode 'batch' on respecte le flag job-level historique.
-        delete_previous_cycle = (
-            cleanup_mode == "batch" and bool(cfg.get("delete_previous_cycle", True))
-        )
-        log.info(
-            "publish_cleanup_mode",
-            cycle_cleanup_mode=cleanup_mode,
-            delete_previous_cycle=delete_previous_cycle,
-        )
 
         await session.start()
         try:
@@ -392,50 +364,12 @@ class Worker:
                 if batch_before is None:
                     log.info("publish_batch_finished", job_id=job.id)
                     break
-                completed_cycle_candidate = batch_before.current_cycle  # capture AVANT avancement
                 transition = uploader.advance_cycle_if_needed()
                 if transition == "no_batch" or transition == "stopped":
                     log.info("publish_batch_finished", job_id=job.id)
                     break
 
-                # 2) Si avancement effectif → nettoyage du cycle PRECEDENT
-                if delete_previous_cycle and transition == "advanced":
-                    log.info(
-                        "cycle_cleanup_triggered",
-                        job_id=job.id,
-                        batch=batch_before.name,
-                        cycle_to_clean=completed_cycle_candidate,
-                    )
-                    try:
-                        # Verifie que le lot n'a pas ete supprime entre temps
-                        if self._state.get_active_batch() is None:
-                            log.warning(
-                                "cycle_cleanup_skipped_batch_gone",
-                                job_id=job.id,
-                            )
-                        else:
-                            result = await cleaner.delete_previous_cycle(
-                                batch_before.name,
-                                completed_cycle_candidate,
-                                cancel_check=lambda: self._state.is_cancellation_requested(job.id),
-                                run_id=job.id,
-                            )
-                            log.info("cycle_cleanup_result", job_id=job.id, **result)
-                    except Exception as e:  # noqa: BLE001
-                        log.error(
-                            "cycle_cleanup_exception",
-                            job_id=job.id,
-                            error=str(e),
-                            exc_info=True,
-                        )
-                        # Politique gamma : on continue malgre l'echec
-
-                # 3) Re-verifie l'etat (le cleanup peut prendre du temps)
-                if self._state.get_active_batch() is None:
-                    log.info("publish_batch_finished", job_id=job.id)
-                    break
-
-                # 4) Publication d'un media du cycle courant
+                # 2) Publication d'un media du cycle courant
                 # FAILSAFE ULTIME : wrapper publish_next() dans un asyncio.wait_for
                 # global (10 min cap). Sans ca, un hang sur un appel Playwright
                 # non-borne (CDP gele, renderer zombie) pouvait bloquer le

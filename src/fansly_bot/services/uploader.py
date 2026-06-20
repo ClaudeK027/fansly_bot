@@ -69,11 +69,11 @@ class UploaderService:
         # "postId") en escaladant en log.error apres N echecs successifs,
         # plutot que de tourner en silence avec 0% capture.
         self._capture_miss_streak: int = 0
-        # Service de rotation per-media. Si non-None (mode
-        # publishing.cycle_cleanup_mode='per_media' du worker), on
-        # invoque rotate_before_publish() AVANT chaque publication pour
-        # supprimer la version precedente du meme media. Si None
-        # (mode 'batch' historique), aucune rotation per-media.
+        # Service de rotation per-media. Injecte par le worker, toujours
+        # actif : AVANT chaque publication, rotate_before_publish() supprime
+        # la version precedente du meme media via le permalien Fansly.
+        # Pour les cycles 1 (pas de precedent) ou les medias sans
+        # fansly_post_id capture, la rotation degrade en skip propre.
         self._cycle_rotator = cycle_rotator
         # Closure d'annulation propagee par le worker
         # (lambda: self._state.is_cancellation_requested(job.id)). Default

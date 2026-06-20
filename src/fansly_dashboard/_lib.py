@@ -516,7 +516,6 @@ def enqueue_publish_job(
     interval_min: float,
     interval_max: float,
     interval_sigma: float = 0.5,
-    delete_previous_cycle: bool = True,
     captions_batch_name: str | None = None,
 ) -> int:
     state = get_state()
@@ -527,7 +526,6 @@ def enqueue_publish_job(
         "interval_min": float(interval_min),
         "interval_max": float(interval_max),
         "interval_sigma": float(interval_sigma),
-        "delete_previous_cycle": bool(delete_previous_cycle),
     }
     if captions_batch_name:
         config["captions_batch_name"] = captions_batch_name

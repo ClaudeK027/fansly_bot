@@ -874,48 +874,6 @@ class TestPurgerHrefStrictMatch(unittest.TestCase):
         self.assertIsNone(self._segment("https://fansly.com/profile/x"))
 
 
-class TestPublishingCycleCleanupMode(unittest.TestCase):
-    """Verifie que le flag cycle_cleanup_mode est bien defini/valide par
-    Pydantic. Les tests sont independants du config.yaml local (peut etre
-    sur batch ou per_media selon l'environnement)."""
-
-    def _minimal_publishing_kwargs(self):
-        return dict(
-            daily_window_local=["00:00", "23:59"],
-            interval_minutes_median=1.0,
-            interval_minutes_sigma=0.5,
-            interval_minutes_min=0.1,
-            interval_minutes_max=10.0,
-            media_extensions=[".mp4"],
-        )
-
-    def test_pydantic_default_is_batch(self):
-        # Construire Publishing SANS specifier cycle_cleanup_mode -> default
-        # Pydantic doit etre "batch" (preserve la backward-compat).
-        from fansly_bot.config import Publishing
-
-        p = Publishing(**self._minimal_publishing_kwargs())
-        self.assertEqual(p.cycle_cleanup_mode, "batch")
-
-    def test_per_media_accepted(self):
-        from fansly_bot.config import Publishing
-
-        p = Publishing(
-            **self._minimal_publishing_kwargs(), cycle_cleanup_mode="per_media",
-        )
-        self.assertEqual(p.cycle_cleanup_mode, "per_media")
-
-    def test_invalid_mode_rejected(self):
-        from pydantic import ValidationError
-        from fansly_bot.config import Publishing
-
-        with self.assertRaises(ValidationError):
-            Publishing(
-                **self._minimal_publishing_kwargs(),
-                cycle_cleanup_mode="wrong_value",
-            )
-
-
 # =================== Phase 0 : fix worker hang ===================
 
 

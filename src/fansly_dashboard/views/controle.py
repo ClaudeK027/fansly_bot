@@ -287,28 +287,15 @@ if _active_tab == "Publication":
                 key=f"pub_sigma_{_preset_key}",
             )
 
-            # Rolling cycle : supprimer le cycle précédent au début de chaque nouveau cycle
-            delete_prev_cycle = st.toggle(
-                "Supprimer le cycle précédent (rolling cycle)",
-                value=True,
-                key=f"pub_delete_prev_{_preset_key}",
-                help=(
-                    "Quand un nouveau cycle commence, les posts du cycle "
-                    "précédent (signés #fyp) sont supprimés de Fansly. "
-                    "Garde un profil 'frais' qui montre uniquement les "
-                    "publications les plus récentes."
-                ),
+            # Rotation per-media : comportement systématique, plus de toggle.
+            # Avant chaque publication d'un media, sa version précédente
+            # (du cycle d'avant) est supprimée via son permalien Fansly.
+            st.caption(
+                ":material/sync: **Rotation per-media** active : à chaque "
+                "republication d'un media, son ancienne version est supprimée "
+                "avant. Ton profil garde toujours les versions les plus "
+                "récentes (signature `#fyp` requise comme garde-fou)."
             )
-            if delete_prev_cycle:
-                st.caption(
-                    ":material/warning: À chaque nouveau cycle, les posts du "
-                    "cycle précédent **seront supprimés** de ton profil."
-                )
-            else:
-                st.caption(
-                    ":material/info: Les cycles s'accumulent — aucun post n'est "
-                    "supprimé entre les cycles."
-                )
             submitted_pub = st.form_submit_button(
                 "Enfiler dans la queue",
                 icon=":material/playlist_add:",
@@ -339,7 +326,6 @@ if _active_tab == "Publication":
                             interval_min=interval_min * factor,
                             interval_max=interval_max * factor,
                             interval_sigma=interval_sigma,
-                            delete_previous_cycle=bool(delete_prev_cycle),
                             captions_batch_name=captions_batch_name,
                         )
                     except Exception as e:  # noqa: BLE001
