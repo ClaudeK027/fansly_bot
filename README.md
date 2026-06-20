@@ -149,6 +149,66 @@ Le worker démarre automatiquement avec le container, le dashboard te permet d'e
 
 ---
 
+## Multi-instance (un bot par compte Fansly)
+
+Le bot supporte plusieurs instances sur la même machine, chacune avec son compte Fansly, son dashboard, et ses données isolées. Idéal si tu gères 2-5 comptes.
+
+### Créer une nouvelle instance — commande unique
+
+```bash
+./scripts/new-instance.sh NAME
+```
+
+Le script orchestre les 3 étapes :
+1. Saisie des identifiants Fansly de ce compte (`.env.NAME`)
+2. Login Fansly manuel via Chromium (sauvegardé dans `data-NAME/browser_profile/`)
+3. Démarrage du container sur un port libre (8501, 8502, …)
+
+À la fin, le dashboard de cette instance est accessible sur `http://localhost:<port>`.
+
+### Gérer les instances
+
+```bash
+# Liste les instances et leur statut (running/stopped, port, dashboard)
+./scripts/list-instances.sh
+
+# Arrête une instance (préserve data + .env, peut être redémarrée)
+./scripts/stop-instance.sh marie
+
+# Redémarre une instance arrêtée
+./scripts/start-instance.sh marie
+
+# Supprime totalement une instance (--with-data pour aussi wiper le data)
+./scripts/destroy-instance.sh marie               # garde data-marie/ + .env.marie
+./scripts/destroy-instance.sh marie --with-data   # wipe tout (irréversible)
+```
+
+### Sous le capot
+
+Chaque instance utilise :
+- **Container Docker dédié** : `fansly-bot-NAME` (project name `fansly-NAME`)
+- **Fichier env dédié** : `.env.NAME` (credentials + slug)
+- **Dossier data dédié** : `data-NAME/` (BDD, browser profile, médias, logs)
+- **Port host unique** : assigné dynamiquement (8501, 8502, …)
+
+Le `docker-compose.yml` est paramétrable via 4 variables d'env :
+```bash
+INSTANCE_NAME=marie \
+ENV_FILE=.env.marie \
+DATA_DIR=./data-marie \
+HOST_PORT=8502 \
+  docker compose --project-name fansly-marie up -d --build
+```
+
+Le single-instance (sans `--instance`) reste pleinement fonctionnel : c'est le comportement par défaut documenté plus haut.
+
+### Limites
+
+- **Anti-détection Fansly** : au-delà de 3-5 comptes depuis la même IP, le risque de pattern bot détectable augmente. Pour scaler plus, prévoir des proxies résidentiels par instance ou plusieurs VPS.
+- **RAM** : ~650 Mo par instance (Python + Streamlit + Chromium headless). Un VPS 4 Go tient 5 instances confortablement, un VPS 8 Go en tient 10.
+
+---
+
 ## Premier usage du dashboard
 
 1. **Onglet Médias → onglet Lots** : crée un premier lot (ex: `ete_2026`), uploade des fichiers via l'expander "Ajouter des médias".

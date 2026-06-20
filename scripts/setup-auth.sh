@@ -49,17 +49,68 @@ check_pwd() {
     fi
 }
 
+# ─── Parse arguments : --instance NAME (multi-instance) ──────────────────
+# Sans --instance : comportement legacy (single-instance, lit .env et
+# stocke dans data/browser_profile/).
+# Avec --instance NAME : lit .env.NAME et stocke dans data-NAME/browser_profile/.
+INSTANCE=""
+ENV_FILE=".env"
+DATA_DIR="data"
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --instance)
+                INSTANCE="$2"
+                shift 2
+                ;;
+            --instance=*)
+                INSTANCE="${1#--instance=}"
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: $0 [--instance NAME]
+
+Sans --instance : utilise .env et data/browser_profile/ (single-instance).
+Avec --instance NAME : utilise .env.NAME et data-NAME/browser_profile/.
+EOF
+                exit 0
+                ;;
+            *)
+                print_error "Argument inconnu : $1"
+                exit 1
+                ;;
+        esac
+    done
+    if [[ -n "$INSTANCE" ]]; then
+        if [[ ! "$INSTANCE" =~ ^[a-zA-Z0-9_]{1,32}$ ]]; then
+            print_error "Nom d'instance invalide : '$INSTANCE'"
+            exit 1
+        fi
+        ENV_FILE=".env.$INSTANCE"
+        DATA_DIR="data-$INSTANCE"
+    fi
+}
+
 check_env_file() {
-    if [[ ! -f ".env" ]]; then
-        print_error "Le fichier .env est manquant."
-        print_error "Lance d'abord : ${BOLD}./scripts/init-env.sh${RESET}"
+    if [[ ! -f "$ENV_FILE" ]]; then
+        print_error "Le fichier $ENV_FILE est manquant."
+        if [[ -n "$INSTANCE" ]]; then
+            print_error "Lance d'abord : ${BOLD}./scripts/init-env.sh --instance $INSTANCE${RESET}"
+        else
+            print_error "Lance d'abord : ${BOLD}./scripts/init-env.sh${RESET}"
+        fi
         exit 1
     fi
     # Validation rapide : les 3 variables doivent être présentes
     for var in FANSLY_USERNAME FANSLY_PASSWORD FANSLY_PROFILE_SLUG; do
-        if ! grep -qE "^${var}=" .env; then
-            print_warn ".env n'a pas la variable ${BOLD}${var}${RESET}."
-            print_warn "Relance ${BOLD}./scripts/init-env.sh${RESET} pour le régénérer."
+        if ! grep -qE "^${var}=" "$ENV_FILE"; then
+            print_warn "$ENV_FILE n'a pas la variable ${BOLD}${var}${RESET}."
+            if [[ -n "$INSTANCE" ]]; then
+                print_warn "Relance ${BOLD}./scripts/init-env.sh --instance $INSTANCE${RESET}."
+            else
+                print_warn "Relance ${BOLD}./scripts/init-env.sh${RESET}."
+            fi
         fi
     done
 }
@@ -135,9 +186,39 @@ install_deps() {
     print_ok "Chromium prêt."
 }
 
+# ─── Génération d'un config.yaml temporaire avec paths overrides ─────────
+# Utilisé seulement si --instance NAME : on duplique config.yaml et on
+# remplace les paths qui pointent vers data/ par data-NAME/. Le code
+# Python ne change pas — il lit le YAML pointé par FANSLY_CONFIG_FILE.
+INSTANCE_CONFIG=""
+prepare_instance_config() {
+    if [[ -z "$INSTANCE" ]]; then return 0; fi
+    INSTANCE_CONFIG="config.${INSTANCE}.yaml"
+    # Substitution des paths data/ -> data-NAME/ (Python yaml.safe_load
+    # accepte les deux formats indifferemment).
+    sed -E \
+        -e "s|(\"|')?data/Medias(\"|')?|\1${DATA_DIR}/Medias\2|g" \
+        -e "s|(\"|')?data/Captions(\"|')?|\1${DATA_DIR}/Captions\2|g" \
+        -e "s|(\"|')?data/state.db(\"|')?|\1${DATA_DIR}/state.db\2|g" \
+        -e "s|(\"|')?data/logs(\"|')?|\1${DATA_DIR}/logs\2|g" \
+        -e "s|(\"|')?data/artifacts(\"|')?|\1${DATA_DIR}/artifacts\2|g" \
+        -e "s|(\"|')?data/browser_profile(\"|')?|\1${DATA_DIR}/browser_profile\2|g" \
+        config.yaml > "$INSTANCE_CONFIG"
+    print_ok "Config instance generee : ${BOLD}${INSTANCE_CONFIG}${RESET}"
+}
+
+cleanup_instance_config() {
+    if [[ -n "$INSTANCE_CONFIG" ]] && [[ -f "$INSTANCE_CONFIG" ]]; then
+        rm -f "$INSTANCE_CONFIG"
+    fi
+}
+
 # ─── Lancement du setup-auth ─────────────────────────────────────────────
 run_setup_auth() {
     print_step "Lancement de Chromium pour le login Fansly"
+    if [[ -n "$INSTANCE" ]]; then
+        echo "  ${DIM}Instance: $INSTANCE | env: $ENV_FILE | data: $DATA_DIR/${RESET}"
+    fi
     echo
     echo "  ${BOLD}${YELLOW}Action requise :${RESET}"
     echo "  ${YELLOW}→ Une fenêtre Chromium va s'ouvrir.${RESET}"
@@ -146,13 +227,33 @@ run_setup_auth() {
     echo "  ${YELLOW}→ Appuie sur Entrée ici pour terminer le setup.${RESET}"
     echo
     sleep 2
-    # PYTHONPATH=src pour que le code source soit trouvé sans `pip install -e .`
-    PYTHONPATH=src python -m fansly_bot setup-auth
+    # Charge le .env (instance-specifique ou legacy) comme variables d'env
+    # exportees, pour que Pydantic les lise en priorite.
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+    # PYTHONPATH=src pour que le code source soit trouve sans `pip install -e .`
+    if [[ -n "$INSTANCE_CONFIG" ]]; then
+        FANSLY_CONFIG_FILE="$INSTANCE_CONFIG" PYTHONPATH=src python -m fansly_bot setup-auth
+    else
+        PYTHONPATH=src python -m fansly_bot setup-auth
+    fi
+}
+
+cleanup_all() {
+    cleanup_venv
+    cleanup_instance_config
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────
 main() {
+    parse_args "$@"
     print_header
+    if [[ -n "$INSTANCE" ]]; then
+        print_step "Instance : ${BOLD}${INSTANCE}${RESET}"
+        echo "  ${DIM}env: $ENV_FILE | data: $DATA_DIR/browser_profile/${RESET}"
+    fi
     check_pwd
     check_env_file
 
@@ -168,21 +269,29 @@ main() {
     print_ok "Python détecté : ${BOLD}$python_cmd${RESET}"
 
     # Setup propre : on nettoie même en cas d'interruption (Ctrl+C)
-    trap cleanup_venv EXIT
+    trap cleanup_all EXIT
 
+    prepare_instance_config
     create_venv "$python_cmd"
     install_deps
     run_setup_auth
 
     echo
     print_ok "${BOLD}Authentification terminée.${RESET}"
-    print_ok "Le profil de session est sauvegardé dans ${BOLD}data/browser_profile/${RESET}"
+    print_ok "Le profil de session est sauvegardé dans ${BOLD}${DATA_DIR}/browser_profile/${RESET}"
 
     echo
     print_step "Prochaine étape"
-    echo "  Lance le bot avec Docker (recommandé) :"
-    echo "    ${BOLD}docker compose up -d --build${RESET}"
-    echo "  Puis ouvre ${BOLD}http://localhost:8501${RESET} dans ton navigateur."
+    if [[ -n "$INSTANCE" ]]; then
+        echo "  Demarre l'instance ${BOLD}${INSTANCE}${RESET} :"
+        echo "    ${BOLD}./scripts/new-instance.sh ${INSTANCE} --start-only${RESET}"
+        echo "  Ou via docker-compose direct :"
+        echo "    ${BOLD}INSTANCE_NAME=${INSTANCE} ENV_FILE=${ENV_FILE} DATA_DIR=./${DATA_DIR} HOST_PORT=<port_libre> docker compose --project-name fansly-${INSTANCE} up -d --build${RESET}"
+    else
+        echo "  Lance le bot avec Docker (recommandé) :"
+        echo "    ${BOLD}docker compose up -d --build${RESET}"
+        echo "  Puis ouvre ${BOLD}http://localhost:8501${RESET} dans ton navigateur."
+    fi
     echo
 }
 

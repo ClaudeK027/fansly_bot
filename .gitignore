@@ -7,6 +7,11 @@
 !.env.example
 data/browser_profile*/
 data/logs/
+# Multi-instance : chaque instance a son propre dossier data-NAME/
+data-*/
+# Config override par instance (genere par setup-auth.sh --instance NAME)
+config.*.yaml
+!config.example.yaml
 # SQLite en mode WAL genere state.db, state.db-wal, state.db-shm — un glob
 # unique couvre tous les fichiers compagnons. Ces fichiers contiennent
 # les captions et l'historique des publications en clair.

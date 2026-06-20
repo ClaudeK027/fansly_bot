@@ -4,13 +4,14 @@
 # dashboard Streamlit. Pour la justification de ce choix (vs 2 containers),
 # voir docs/VPS_DEPLOY.md.
 #
-# Usage :
-#   docker compose up -d        # demarre en background
-#   docker compose logs -f      # suit les logs en temps reel
-#   docker compose restart      # restart container
-#   docker compose down         # stoppe et supprime le container
-#   docker compose build        # rebuild apres modif du code
-#   docker compose up -d --build  # rebuild + restart
+# Usage single-instance (legacy, comportement par defaut) :
+#   docker compose up -d --build
+#
+# Usage multi-instance (variables INSTANCE_NAME, ENV_FILE, DATA_DIR, HOST_PORT) :
+#   INSTANCE_NAME=marie ENV_FILE=.env.marie DATA_DIR=./data-marie HOST_PORT=8502 \
+#     docker compose --project-name fansly-marie up -d --build
+#
+# Le script ./scripts/new-instance.sh NAME automatise tout cela.
 
 services:
   fansly-bot:
@@ -18,7 +19,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: fansly-bot:latest
-    container_name: fansly-bot
+    # MULTI-INSTANCE : suffixe ajoute si INSTANCE_NAME defini, sinon "default"
+    container_name: fansly-bot-${INSTANCE_NAME:-default}
 
     # Restart automatique apres un crash, un reboot du VPS, ou un kill OOM.
     # `unless-stopped` : ne relance PAS si on a explicitement fait
@@ -26,28 +28,27 @@ services:
     restart: unless-stopped
 
     # Credentials Fansly (FANSLY_USERNAME, FANSLY_PASSWORD) charges depuis
-    # /opt/fansly-bot/.env sur le VPS. Voir docs/VPS_DEPLOY.md pour le format.
+    # ENV_FILE (default .env). Pour multi-instance, set ENV_FILE=.env.NAME.
     env_file:
-      - .env
+      - ${ENV_FILE:-.env}
 
     # Override de AUTOSTART_WORKER si besoin (defaut true via entrypoint).
     # Decommente pour desactiver l autostart :
     # environment:
     #   AUTOSTART_WORKER: "false"
 
-    # Bind mounts : tout l etat persistant vit dans ./data du host.
-    # Backup facile : rsync ./data depuis le VPS.
+    # Bind mounts : tout l etat persistant vit dans DATA_DIR du host (default
+    # ./data). Pour multi-instance, set DATA_DIR=./data-NAME pour isoler.
     # config.yaml en lecture seule : le code applicatif ne le modifie pas.
     volumes:
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
       - ./config.yaml:/app/config.yaml:ro
 
-    # Streamlit uniquement accessible sur 127.0.0.1 du VPS (pas d exposition
-    # publique). Acces via tunnel SSH depuis le poste local :
-    #   ssh -L 8501:localhost:8501 user@vps
-    # puis http://localhost:8501 dans le navigateur local.
+    # Streamlit accessible sur 127.0.0.1 du VPS uniquement (pas d exposition
+    # publique). Port host configurable via HOST_PORT (default 8501).
+    # Acces via tunnel SSH : ssh -L 8501:localhost:${HOST_PORT} user@vps
     ports:
-      - "127.0.0.1:8501:8501"
+      - "127.0.0.1:${HOST_PORT:-8501}:8501"
 
     # Chromium a besoin d un /dev/shm assez grand pour eviter les crashes
     # "Out of memory" sur les pages lourdes (composer Fansly avec medias).

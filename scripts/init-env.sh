@@ -50,20 +50,65 @@ check_pwd() {
     fi
 }
 
+# ─── Parse arguments : --instance NAME (multi-instance) ──────────────────
+# Sans --instance : comportement legacy (single-instance, ecrit .env).
+# Avec --instance NAME : ecrit .env.NAME (multi-instance).
+INSTANCE=""
+ENV_FILE=".env"
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --instance)
+                INSTANCE="$2"
+                shift 2
+                ;;
+            --instance=*)
+                INSTANCE="${1#--instance=}"
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: $0 [--instance NAME]
+
+Sans --instance : cree .env (mode single-instance, comportement historique).
+Avec --instance NAME : cree .env.NAME (mode multi-instance).
+
+NAME doit etre un identifiant simple (lettres, chiffres, _, max 32 chars).
+EOF
+                exit 0
+                ;;
+            *)
+                print_error "Argument inconnu : $1"
+                print_error "Voir: $0 --help"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -n "$INSTANCE" ]]; then
+        if [[ ! "$INSTANCE" =~ ^[a-zA-Z0-9_]{1,32}$ ]]; then
+            print_error "Nom d'instance invalide : '$INSTANCE'"
+            print_error "Format requis : 1-32 chars, lettres/chiffres/_ uniquement."
+            exit 1
+        fi
+        ENV_FILE=".env.$INSTANCE"
+    fi
+}
+
 # ─── Sauvegarde d'un éventuel .env existant ──────────────────────────────
 handle_existing_env() {
-    if [[ -f ".env" ]]; then
-        print_warn "Un fichier ${BOLD}.env${RESET} existe déjà."
+    if [[ -f "$ENV_FILE" ]]; then
+        print_warn "Un fichier ${BOLD}${ENV_FILE}${RESET} existe déjà."
         echo "  Que faire ?"
-        echo "    ${BOLD}[1]${RESET} Le sauvegarder en .env.backup et en créer un nouveau (défaut)"
+        echo "    ${BOLD}[1]${RESET} Le sauvegarder en ${ENV_FILE}.backup et en créer un nouveau (défaut)"
         echo "    ${BOLD}[2]${RESET} Annuler"
         echo
         read -r -p "  Ton choix [1] : " choice
         choice="${choice:-1}"
         case "$choice" in
             1)
-                mv .env .env.backup
-                print_ok ".env existant sauvegardé en ${BOLD}.env.backup${RESET}"
+                mv "$ENV_FILE" "${ENV_FILE}.backup"
+                print_ok "${ENV_FILE} existant sauvegardé en ${BOLD}${ENV_FILE}.backup${RESET}"
                 ;;
             2)
                 print_warn "Annulé. Aucune modification."
@@ -166,31 +211,31 @@ confirm_and_write() {
     echo "    FANSLY_PASSWORD      = $masked"
     echo "    FANSLY_PROFILE_SLUG  = $FANSLY_PROFILE_SLUG"
     echo
-    read -r -p "  Confirmer et écrire le .env ? [O/n] : " confirm
+    read -r -p "  Confirmer et écrire le ${ENV_FILE} ? [O/n] : " confirm
     case "${confirm:-O}" in
         [OoYy]*) ;;
         *)
-            print_warn "Annulé. Le .env n'a pas été créé."
-            # Restaure le .env.backup si applicable
-            if [[ -f ".env.backup" ]] && [[ ! -f ".env" ]]; then
-                mv .env.backup .env
-                print_ok ".env précédent restauré."
+            print_warn "Annulé. Le ${ENV_FILE} n'a pas été créé."
+            # Restaure le backup si applicable
+            if [[ -f "${ENV_FILE}.backup" ]] && [[ ! -f "$ENV_FILE" ]]; then
+                mv "${ENV_FILE}.backup" "$ENV_FILE"
+                print_ok "${ENV_FILE} précédent restauré."
             fi
             exit 0
             ;;
     esac
 
-    # Écriture du .env
-    cat > .env <<EOF
-# .env — généré par scripts/init-env.sh
+    # Écriture du fichier env (instance-specific ou legacy)
+    cat > "$ENV_FILE" <<EOF
+# $ENV_FILE — généré par scripts/init-env.sh
 # NE JAMAIS commit ce fichier — il contient des secrets.
 
 FANSLY_USERNAME=$FANSLY_USERNAME
 FANSLY_PASSWORD=$FANSLY_PASSWORD
 FANSLY_PROFILE_SLUG=$FANSLY_PROFILE_SLUG
 EOF
-    chmod 600 .env
-    print_ok ".env créé : ${BOLD}$(pwd)/.env${RESET}"
+    chmod 600 "$ENV_FILE"
+    print_ok "${ENV_FILE} créé : ${BOLD}$(pwd)/${ENV_FILE}${RESET}"
     print_ok "Permissions : ${BOLD}chmod 600${RESET} (lecture/écriture propriétaire uniquement)"
 }
 
@@ -201,25 +246,38 @@ propose_next_step() {
     echo "  Tu dois maintenant authentifier le bot auprès de Fansly."
     echo "  Cela ouvrira Chromium pour te laisser te connecter à la main."
     echo
+    # Propagation de --instance NAME au setup-auth si on est en multi-instance
+    local setup_args=()
+    if [[ -n "$INSTANCE" ]]; then
+        setup_args=(--instance "$INSTANCE")
+    fi
+    local setup_cmd="./scripts/setup-auth.sh"
+    if [[ -n "$INSTANCE" ]]; then
+        setup_cmd="./scripts/setup-auth.sh --instance $INSTANCE"
+    fi
     if [[ -x "./scripts/setup-auth.sh" ]]; then
-        read -r -p "  Lancer ${BOLD}./scripts/setup-auth.sh${RESET} maintenant ? [O/n] : " run_setup
+        read -r -p "  Lancer ${BOLD}${setup_cmd}${RESET} maintenant ? [O/n] : " run_setup
         case "${run_setup:-O}" in
             [OoYy]*)
                 echo
-                exec ./scripts/setup-auth.sh
+                exec ./scripts/setup-auth.sh "${setup_args[@]}"
                 ;;
             *)
-                echo "  Quand tu seras prêt, lance : ${BOLD}./scripts/setup-auth.sh${RESET}"
+                echo "  Quand tu seras prêt, lance : ${BOLD}${setup_cmd}${RESET}"
                 ;;
         esac
     else
-        echo "  Lance : ${BOLD}./scripts/setup-auth.sh${RESET}"
+        echo "  Lance : ${BOLD}${setup_cmd}${RESET}"
     fi
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────
 main() {
+    parse_args "$@"
     print_header
+    if [[ -n "$INSTANCE" ]]; then
+        print_step "Instance : ${BOLD}${INSTANCE}${RESET} (sera ecrite dans ${ENV_FILE})"
+    fi
     check_pwd
     handle_existing_env
     print_step "Identifiants Fansly"
