@@ -19,7 +19,11 @@ if TYPE_CHECKING:
 # Le manager lui-meme s'appelle "fansly-manager" -> on l'exclut des listings.
 # Le format attendu d'un container instance est "fansly-bot-NAME" ou NAME
 # matche la regex de --instance de init-env.sh (alphanumerique + underscore).
+# On reconnait aussi l'ancien format single-instance "fansly-bot" (sans
+# suffixe) comme l'instance "default" pour la retro-compat des deployments
+# qui n'ont pas encore migre vers le nommage multi-instance.
 _INSTANCE_NAME_RE = re.compile(r"^fansly-bot-(?P<name>[A-Za-z0-9_]+)$")
+_LEGACY_NAME_RE = re.compile(r"^fansly-bot$")
 
 
 def _docker():
@@ -76,11 +80,16 @@ def list_instances() -> list[Instance]:
     instances: list[Instance] = []
     for c in client.containers.list(all=True):
         m = _INSTANCE_NAME_RE.match(c.name)
-        if m is None:
+        if m is not None:
+            name = m.group("name")
+        elif _LEGACY_NAME_RE.match(c.name):
+            # Container legacy single-instance pre-multi-instance.
+            name = "default"
+        else:
             continue
         instances.append(
             Instance(
-                name=m.group("name"),
+                name=name,
                 container=c.name,
                 status=c.status,
                 host_port=_extract_host_port(c),
@@ -99,11 +108,35 @@ def get_instance(name: str) -> Optional[Instance]:
     return None
 
 
+def _resolve_container_name(name: str) -> str:
+    """Resout le nom de container Docker depuis le nom logique d'instance.
+
+    Pour "default", essaye d'abord le format moderne ``fansly-bot-default``
+    et fallback sur l'ancien ``fansly-bot`` si le moderne n'existe pas (cas
+    des deployments legacy non encore migres).
+    """
+    client = _client()
+    nf_exc = _docker().errors.NotFound
+    modern = f"fansly-bot-{name}"
+    try:
+        client.containers.get(modern)
+        return modern
+    except nf_exc:
+        pass
+    if name == "default":
+        try:
+            client.containers.get("fansly-bot")
+            return "fansly-bot"
+        except nf_exc:
+            pass
+    return modern  # par defaut on retourne le format moderne (NotFound a l'usage)
+
+
 def start_instance(name: str) -> bool:
     """Demarre un container stoppe. Retourne True si OK, False si introuvable."""
     client = _client()
     try:
-        c = client.containers.get(f"fansly-bot-{name}")
+        c = client.containers.get(_resolve_container_name(name))
         c.start()
         return True
     except _docker().errors.NotFound:
@@ -114,7 +147,7 @@ def stop_instance(name: str, timeout: int = 30) -> bool:
     """Stoppe gracieusement un container (SIGTERM puis SIGKILL apres timeout)."""
     client = _client()
     try:
-        c = client.containers.get(f"fansly-bot-{name}")
+        c = client.containers.get(_resolve_container_name(name))
         c.stop(timeout=timeout)
         return True
     except _docker().errors.NotFound:
@@ -125,7 +158,7 @@ def restart_instance(name: str, timeout: int = 30) -> bool:
     """Redemarre un container (preserve les volumes et la config)."""
     client = _client()
     try:
-        c = client.containers.get(f"fansly-bot-{name}")
+        c = client.containers.get(_resolve_container_name(name))
         c.restart(timeout=timeout)
         return True
     except _docker().errors.NotFound:
