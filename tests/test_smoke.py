@@ -957,6 +957,42 @@ class TestAuthSessionCheckCache(unittest.IsolatedAsyncioTestCase):
             await svc.ensure_logged_in()
 
 
+# =================== Phase 2 : manager UI (instances.py) ==================
+
+
+class TestManagerInstanceRegex(unittest.TestCase):
+    """Verifie le pattern _INSTANCE_NAME_RE qui extrait le nom d'une
+    instance depuis le nom de son container (fansly-bot-NAME)."""
+
+    def test_extracts_valid_names(self):
+        from fansly_manager.instances import _INSTANCE_NAME_RE
+
+        for container, expected in [
+            ("fansly-bot-marie", "marie"),
+            ("fansly-bot-camille_2", "camille_2"),
+            ("fansly-bot-LolaTest", "LolaTest"),
+            ("fansly-bot-default", "default"),
+            ("fansly-bot-instance_42", "instance_42"),
+        ]:
+            m = _INSTANCE_NAME_RE.match(container)
+            self.assertIsNotNone(m, f"Should match: {container}")
+            self.assertEqual(m.group("name"), expected)
+
+    def test_rejects_non_bot_containers(self):
+        from fansly_manager.instances import _INSTANCE_NAME_RE
+
+        for container in [
+            "fansly-manager",       # le manager lui-meme — exclu
+            "fansly-bot",           # ancien format (sans suffixe)
+            "fansly-bot-",          # suffixe vide
+            "fansly-bot-a-b",       # tiret au milieu interdit
+            "other-container",
+            "fansly_bot_marie",     # underscores partout, pas le bon format
+        ]:
+            m = _INSTANCE_NAME_RE.match(container)
+            self.assertIsNone(m, f"Should NOT match: {container}")
+
+
 # =================== entry point ===================
 
 if __name__ == "__main__":

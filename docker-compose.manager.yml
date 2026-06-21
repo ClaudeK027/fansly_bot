@@ -1,0 +1,47 @@
+# Manager UI unifie pour gerer plusieurs instances Fansly bot.
+#
+# Service SEPARE du docker-compose.yml principal pour eviter les
+# conflits de project name avec les instances bot. Le manager n'a PAS
+# besoin d'etre dans le meme reseau que les bots — il pilote les
+# containers via le socket Docker, pas via le reseau interne.
+#
+# Usage :
+#   docker compose -f docker-compose.manager.yml --project-name fansly-manager up -d --build
+#
+# Acces UI (via tunnel SSH si VPS) :
+#   ssh -L 8500:localhost:8500 user@vps
+#   puis http://localhost:8500
+#
+# Pour lancer le manager + une instance default ensemble :
+#   docker compose -f docker-compose.yml up -d --build              # instance bot default
+#   docker compose -f docker-compose.manager.yml --project-name fansly-manager up -d --build
+
+services:
+  fansly-manager:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.manager
+    image: fansly-manager:latest
+    container_name: fansly-manager
+    restart: unless-stopped
+
+    # Bind du socket Docker en lecture-ecriture : indispensable pour
+    # start/stop les containers fansly-bot-* depuis l'UI. SECURITE : ne
+    # JAMAIS exposer ce manager publiquement — c'est l'equivalent d'un
+    # acces root sur la machine hote via Docker.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    # Port host : 8500 (les instances bot sont sur 8501, 8502, ...)
+    # 127.0.0.1 uniquement — acces via tunnel SSH depuis le poste user.
+    ports:
+      - "127.0.0.1:8500:8500"
+
+    init: true
+    mem_limit: 512m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

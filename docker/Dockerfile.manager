@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+#
+# Image legere pour le Fansly Manager (UI Streamlit unifie qui pilote
+# les containers fansly-bot-NAME via le socket Docker).
+#
+# Pas besoin de Playwright/Chromium ici — le manager ne fait pas d'auto
+# Playwright lui-meme, il delegue aux instances bot.
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+# Dependances : streamlit pour l'UI, docker-py pour piloter les containers
+# voisins via /var/run/docker.sock.
+RUN pip install --upgrade pip && \
+    pip install \
+        "streamlit>=1.40.0" \
+        "docker>=7.0.0"
+
+# Copie le code du manager (les autres modules ne sont PAS necessaires)
+COPY src/fansly_manager /app/src/fansly_manager
+
+# Streamlit ecoute par defaut sur 0.0.0.0:8500 (override via flags)
+EXPOSE 8500
+
+# Configuration minimale Streamlit : pas de telemetrie, pas de XSRF
+# (le manager est uniquement accessible derriere tunnel SSH, jamais public)
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_HEADLESS=true
+
+CMD ["streamlit", "run", "/app/src/fansly_manager/main.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8500", \
+     "--browser.gatherUsageStats=false"]

@@ -209,6 +209,50 @@ Le single-instance (sans `--instance`) reste pleinement fonctionnel : c'est le c
 
 ---
 
+## Manager unifié — piloter toutes les instances depuis une seule UI
+
+Plutôt que d'ouvrir 5 onglets de dashboard sur 5 ports différents, le **Manager** te donne une UI unique (port 8500) avec :
+
+- **Sidebar** : sélecteur d'instance (`🟢 marie`, `🔴 camille`, ...) + boutons start/stop/restart par instance
+- **Vue d'ensemble** : tableau de toutes les instances (status, port, dashboard URL, KPIs cross-comptes)
+- **Vue instance** : iframe vers le dashboard de l'instance sélectionnée, intégrée dans la même page
+
+### Démarrage
+
+```bash
+./scripts/start-manager.sh           # démarre (build au 1er run, ~30s)
+./scripts/start-manager.sh logs      # suivre les logs en direct
+./scripts/start-manager.sh stop      # arrêter
+```
+
+Puis ouvre `http://localhost:8500`. Si tu es sur un VPS, tunnel SSH :
+
+```bash
+ssh -L 8500:localhost:8500 user@vps
+```
+
+### Architecture
+
+```
+Container fansly-manager (port 8500)
+    │
+    ├─ Streamlit UI multi-comptes
+    └─ Bind /var/run/docker.sock
+           │
+           ▼ (pilote via SDK Python docker-py)
+    Containers fansly-bot-marie, fansly-bot-camille, ...
+        (sur ports 8501, 8502, ...)
+```
+
+Le manager n'a **pas** besoin d'être dans le même réseau Docker que les bots — il les pilote uniquement via le socket Docker monté en bind.
+
+### Sécurité
+
+- Le socket Docker monté en bind donne au manager un **équivalent root** sur la machine hôte. **Jamais d'exposition publique** — accès uniquement via tunnel SSH (port `127.0.0.1:8500` seulement).
+- Les iframes des dashboards individuels sont résolues par le navigateur de l'utilisateur, donc passent aussi par le tunnel SSH si on est sur VPS (le tunnel doit alors forward 8501-8510 en plus de 8500, ou faire un tunnel `*:*` style `-D 1080` SOCKS).
+
+---
+
 ## Premier usage du dashboard
 
 1. **Onglet Médias → onglet Lots** : crée un premier lot (ex: `ete_2026`), uploade des fichiers via l'expander "Ajouter des médias".
