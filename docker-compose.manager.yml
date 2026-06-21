@@ -16,6 +16,17 @@
 #   docker compose -f docker-compose.yml up -d --build              # instance bot default
 #   docker compose -f docker-compose.manager.yml --project-name fansly-manager up -d --build
 
+# TODO Phase 5 — security hardening (a faire avant deploiement multi-operateur) :
+#   - Remplacer le bind direct de /var/run/docker.sock par un docker-socket-proxy
+#     (tecnativa/docker-socket-proxy) avec whitelist d'endpoints :
+#     /containers/json, /containers/{id}/{json,start,stop,restart}
+#   - Pin l'image base par digest : python:3.12.X-slim@sha256:...
+#   - Lockfile pip (requirements.manager.lock + --require-hashes)
+#   - Filtrer les containers par label fansly.role=bot (au lieu du seul nom)
+#   - Auth applicative : env var FANSLY_MANAGER_TOKEN + reverse-proxy nginx
+#   - Trivy scan dans la CI sur l'image fansly-manager:latest
+#   - Healthcheck Streamlit (_stcore/health) + alerte sur restart-count > N
+
 services:
   fansly-manager:
     build:

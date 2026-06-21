@@ -1,168 +1,161 @@
 """Point d'entree Streamlit du Fansly Manager.
 
-Lance via : streamlit run src/fansly_manager/main.py --server.port=8500
+Architecture :
+- ``main()`` charge UNE FOIS la liste des instances (cache 3s) puis la
+  passe a la sidebar et a la vue. Evite les doubles round-trips Docker
+  par render Streamlit.
+- En cas d'echec Docker (daemon DOWN, socket EACCES), on affiche un
+  ecran d'erreur clair plutot que crasher la page.
+- La sidebar permet de scroll-to-anchor sur une card via ancre HTML
+  (``#fm-card-NAME``) — pas de st.button qui ferait juste rerun pour
+  rien.
+
+Lance via : ``streamlit run src/fansly_manager/main.py --server.port=8500``
 """
 from __future__ import annotations
+
+from typing import Optional
 
 import streamlit as st
 
 from fansly_manager import instances as inst_mod
+from fansly_manager import styles
+from fansly_manager.views import overview as overview_view
+
 
 st.set_page_config(
     page_title="Fansly Manager",
-    page_icon="🎛️",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={"Get Help": None, "Report a bug": None, "About": None},
 )
 
+styles.inject()
 
-def _render_sidebar() -> str | None:
-    """Sidebar : selecteur d'instance + actions par instance.
 
-    Retourne le nom de l'instance courante (None si vue d'ensemble)."""
-    st.sidebar.title("🎛️ Fansly Manager")
-    st.sidebar.caption("Gestion multi-comptes (instances Docker isolees)")
+@st.cache_data(ttl=3, show_spinner=False)
+def _cached_list_instances() -> tuple[list[dict], Optional[str]]:
+    """Cache 3s pour eviter les double-calls sidebar+vue.
 
-    instances = inst_mod.list_instances()
+    Retourne (instances_as_dicts, error_msg). On serialise en dict pour
+    que st.cache_data puisse hash le resultat (les dataclass sont OK
+    aussi mais cache_data prefere les types primitifs).
+    """
+    result = inst_mod.safe_list_instances()
+    if not result.ok:
+        return [], result.error
+    return [_inst_to_dict(i) for i in (result.value or [])], None
+
+
+def _inst_to_dict(i: inst_mod.Instance) -> dict:
+    return {
+        "name": i.name,
+        "container": i.container,
+        "status": i.status,
+        "host_port": i.host_port,
+        "image": i.image,
+        "started_at": i.started_at,
+    }
+
+
+def _dict_to_inst(d: dict) -> inst_mod.Instance:
+    return inst_mod.Instance(**d)
+
+
+def _render_sidebar(instances: list[inst_mod.Instance]) -> None:
+    """Sidebar minimaliste : branding + navigation rapide (anchor HTML)."""
+    st.sidebar.title("Fansly Manager")
+    st.sidebar.caption("Pilotage central des bots")
+
+    st.sidebar.divider()
 
     if not instances:
-        st.sidebar.info(
-            "Aucune instance n'existe encore.\n\n"
-            "Pour en créer une, lance dans ton terminal :\n\n"
-            "```bash\n./scripts/new-instance.sh NAME\n```"
+        st.sidebar.caption("Aucun bot configure pour le moment.")
+        return
+
+    # Tri par status : running en premier, puis stopped
+    running = [i for i in instances if i.is_running]
+    stopped = [i for i in instances if not i.is_running]
+
+    def _list_block(title: str, items: list[inst_mod.Instance], color_class: str) -> None:
+        if not items:
+            return
+        st.sidebar.markdown(
+            f'<div class="fm-sidebar-section">{title} '
+            f'<span class="fm-sidebar-count">{len(items)}</span></div>',
+            unsafe_allow_html=True,
         )
-        return None
-
-    # Selecteur : "Vue d'ensemble" + liste des instances
-    options = ["📊 Vue d'ensemble"] + [
-        f"{'🟢' if i.is_running else '🔴'} {i.name}" for i in instances
-    ]
-    choice = st.sidebar.radio(
-        "Compte actif",
-        options,
-        key="current_choice",
-        label_visibility="collapsed",
-    )
-
-    if choice.startswith("📊"):
-        return None
-
-    # Extrait le nom de l'option formatee
-    chosen_name = choice.split(" ", 1)[1]
-
-    # Actions sur le compte selectionne
-    st.sidebar.divider()
-    current = inst_mod.get_instance(chosen_name)
-    if current is None:
-        st.sidebar.error("Instance disparue.")
-        return None
-
-    if current.is_running:
-        st.sidebar.success(f"🟢 {current.name} — running")
-        if current.dashboard_url:
-            st.sidebar.markdown(
-                f"**Dashboard** : [{current.dashboard_url}]({current.dashboard_url})"
+        # Liens HTML qui scroll vers la card (pas des st.button : pas de
+        # rerun inutile, pas d'effet menteur — l'ancre fait reellement
+        # quelque chose de visible).
+        anchor_html = []
+        for inst in items:
+            import html
+            safe_name = html.escape(inst.name)
+            anchor_html.append(
+                f'<a class="fm-sidebar-link fm-sidebar-link-{color_class}" '
+                f'href="#fm-card-{safe_name}">{safe_name}</a>'
             )
-        c1, c2 = st.sidebar.columns(2)
-        with c1:
-            if st.button("⏹ Stopper", key="btn_stop", use_container_width=True):
-                inst_mod.stop_instance(current.name)
-                st.rerun()
-        with c2:
-            if st.button("🔄 Redémarrer", key="btn_restart", use_container_width=True):
-                inst_mod.restart_instance(current.name)
-                st.rerun()
-    else:
-        st.sidebar.warning(f"🔴 {current.name} — {current.status}")
-        if st.sidebar.button("▶️ Démarrer", key="btn_start", use_container_width=True):
-            inst_mod.start_instance(current.name)
-            st.rerun()
+        st.sidebar.markdown(
+            "".join(anchor_html),
+            unsafe_allow_html=True,
+        )
+
+    _list_block("En fonctionnement", running, "running")
+    _list_block("Arretes", stopped, "stopped")
 
     st.sidebar.divider()
-    st.sidebar.caption(
-        "**Ajouter un compte** :\n\n"
-        "```bash\n./scripts/new-instance.sh NEW_NAME\n```\n\n"
-        "_(le wizard noVNC arrive en Phase 3.)_"
+    st.sidebar.markdown(
+        '<div class="fm-sidebar-section">Ajouter un compte</div>',
+        unsafe_allow_html=True,
     )
-
-    return chosen_name
-
-
-def _render_overview() -> None:
-    """Vue d'ensemble : tableau de toutes les instances avec leur status."""
-    st.title("📊 Vue d'ensemble — Toutes les instances")
-
-    instances = inst_mod.list_instances()
-    if not instances:
-        st.info(
-            "Aucune instance pour l'instant.\n\n"
-            "Crée-en une avec `./scripts/new-instance.sh NAME` puis recharge cette page."
-        )
-        return
-
-    # KPIs en haut
-    running = sum(1 for i in instances if i.is_running)
-    total = len(instances)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Instances totales", total)
-    col2.metric("Running", running)
-    col3.metric("Arrêtées", total - running)
-
-    st.divider()
-
-    # Tableau detaille
-    rows = []
-    for i in instances:
-        rows.append({
-            "Compte": i.name,
-            "Status": "🟢 running" if i.is_running else f"🔴 {i.status}",
-            "Port": i.host_port if i.host_port else "—",
-            "Dashboard": i.dashboard_url if i.dashboard_url else "—",
-            "Container": i.container,
-        })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-
-def _render_instance_dashboard(name: str) -> None:
-    """Vue d'une instance : iframe vers son dashboard Streamlit."""
-    inst = inst_mod.get_instance(name)
-    if inst is None:
-        st.error(f"Instance {name} introuvable.")
-        return
-
-    st.title(f"🎯 Dashboard — {inst.name}")
-    if not inst.is_running:
-        st.error(
-            f"L'instance **{inst.name}** est actuellement **{inst.status}**.\n\n"
-            "Démarre-la depuis la sidebar pour accéder à son dashboard."
-        )
-        return
-
-    if inst.dashboard_url is None:
-        st.warning(
-            "Aucun port host mappe pour cette instance. "
-            "Verifie la config docker-compose."
-        )
-        return
-
-    # Iframe vers le dashboard de l'instance. L'utilisateur accede au manager
-    # via tunnel SSH sur 8500, et le dashboard de l'instance est sur 8501+.
-    # L'iframe pointe vers localhost:<port> qui resout cote browser de l'user
-    # (donc passe par le tunnel SSH si on est sur VPS).
-    st.caption(f"Dashboard intégré depuis {inst.dashboard_url}")
-    st.components.v1.iframe(
-        src=inst.dashboard_url,
-        height=900,
-        scrolling=True,
+    st.sidebar.code(
+        "./scripts/new-instance.sh NAME",
+        language="bash",
     )
+    st.sidebar.caption("Wizard guide arrive en Phase 3 (noVNC).")
+
+
+def _render_docker_error(error_msg: str) -> None:
+    """Ecran d'erreur quand le daemon Docker est injoignable."""
+    st.markdown(
+        '<div class="fm-page-title">Connexion Docker impossible</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="fm-page-subtitle">'
+        "Le manager ne peut pas joindre le daemon Docker. "
+        "Verifie que :"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "- Docker Desktop / le daemon docker tourne sur l'hote\n"
+        "- Le socket `/var/run/docker.sock` est bien monte en bind dans "
+        "le container manager (cf. `docker-compose.manager.yml`)\n"
+        "- Le user du container a les permissions sur le socket"
+    )
+    import html
+    st.markdown(
+        f'<div class="fm-empty-code">Erreur Docker : {html.escape(error_msg)}</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("Retenter", key="retry_docker"):
+        _cached_list_instances.clear()
+        st.rerun()
 
 
 def main() -> None:
-    chosen = _render_sidebar()
-    if chosen is None:
-        _render_overview()
-    else:
-        _render_instance_dashboard(chosen)
+    instance_dicts, error = _cached_list_instances()
+    if error:
+        _render_sidebar([])
+        _render_docker_error(error)
+        return
+
+    instances = [_dict_to_inst(d) for d in instance_dicts]
+    _render_sidebar(instances)
+    overview_view.render(instances)
 
 
 main()

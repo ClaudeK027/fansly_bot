@@ -988,9 +988,165 @@ class TestManagerInstanceRegex(unittest.TestCase):
             "fansly-bot-a-b",       # tiret au milieu interdit
             "other-container",
             "fansly_bot_marie",     # underscores partout, pas le bon format
+            "fansly-bot-" + "a" * 65,  # cap a 64 chars
         ]:
             m = _INSTANCE_NAME_RE.match(container)
             self.assertIsNone(m, f"Should NOT match: {container}")
+
+
+class TestManagerStatusPill(unittest.TestCase):
+    """Verifie que status_pill est XSS-safe et accessible (glyphe geometrique)."""
+
+    def test_escapes_malicious_status(self):
+        from fansly_manager.components import status_pill
+
+        html_out = status_pill('<script>alert("xss")</script>')
+        # Le payload brut ne doit jamais apparaitre tel quel
+        self.assertNotIn("<script>", html_out)
+        self.assertNotIn('alert("xss")', html_out)
+        # Et il doit etre escape — le case-insensitive permet l'upper-case
+        # qu'on applique au label
+        self.assertIn("&lt;", html_out.lower())
+        self.assertIn("&gt;", html_out.lower())
+
+    def test_includes_geometric_glyph_for_accessibility(self):
+        # Daltoniens : la couleur seule ne suffit pas, on ajoute un symbole.
+        from fansly_manager.components import status_pill
+
+        html = status_pill("running")
+        self.assertIn("●", html)
+        self.assertIn("fm-status-glyph", html)
+        self.assertIn("aria-hidden", html)
+
+    def test_unknown_status_uses_default(self):
+        from fansly_manager.components import status_pill
+
+        html = status_pill("frobnicated")
+        self.assertIn("fm-status-unknown", html)
+        self.assertIn("○", html)  # cercle vide pour unknown
+
+
+class TestManagerHumanizeDuration(unittest.TestCase):
+    """Edge cases de humanize_duration (negatif, float, bornes minutes/heures/jours)."""
+
+    def test_zero_seconds(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(0), "0 s")
+
+    def test_seconds_below_minute(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(45), "45 s")
+        self.assertEqual(humanize_duration(59), "59 s")
+
+    def test_minutes(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(60), "1 min")
+        self.assertEqual(humanize_duration(3599), "59 min")
+
+    def test_hours(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(3600), "1 h")
+        self.assertEqual(humanize_duration(3720), "1 h 2 min")
+        self.assertEqual(humanize_duration(86399), "23 h 59 min")
+
+    def test_days(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(86400), "1 j")
+        self.assertEqual(humanize_duration(90000), "1 j 1 h")
+
+    def test_negative_returns_dash_not_zero(self):
+        # int(-0.5) = 0 sans le check explicit < 0 -> on rendrait "0 s"
+        # On veut "—" pour signaler une valeur invalide.
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration(-5), "—")
+        self.assertEqual(humanize_duration(-0.5), "—")
+
+    def test_invalid_type_returns_dash(self):
+        from fansly_manager.components import humanize_duration
+        self.assertEqual(humanize_duration("not a number"), "—")
+        self.assertEqual(humanize_duration(None), "—")
+
+
+class TestManagerDashboardUrl(unittest.TestCase):
+    """Property dashboard_url : 4 combinaisons running/port."""
+
+    def _inst(self, status, port):
+        from fansly_manager.instances import Instance
+        return Instance(
+            name="t", container="fansly-bot-t",
+            status=status, host_port=port, image="x",
+        )
+
+    def test_running_with_port(self):
+        self.assertEqual(self._inst("running", 8501).dashboard_url, "http://localhost:8501")
+
+    def test_running_no_port(self):
+        self.assertIsNone(self._inst("running", None).dashboard_url)
+
+    def test_stopped_with_port(self):
+        self.assertIsNone(self._inst("exited", 8501).dashboard_url)
+
+    def test_stopped_no_port(self):
+        self.assertIsNone(self._inst("exited", None).dashboard_url)
+
+    def test_invalid_port_rejected(self):
+        # Port en dehors de la plage non-privilegiee 1024-65535
+        self.assertIsNone(self._inst("running", 0).dashboard_url)
+        self.assertIsNone(self._inst("running", -1).dashboard_url)
+        self.assertIsNone(self._inst("running", 70000).dashboard_url)
+
+
+class TestManagerExtractHostPort(unittest.TestCase):
+    """_extract_host_port avec shapes Docker variees."""
+
+    def test_normal_mapping(self):
+        from fansly_manager.instances import _extract_host_port
+        attrs = {"NetworkSettings": {"Ports": {
+            "8501/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8501"}]
+        }}}
+        self.assertEqual(_extract_host_port(attrs), 8501)
+
+    def test_prefers_localhost_over_other_ips(self):
+        from fansly_manager.instances import _extract_host_port
+        attrs = {"NetworkSettings": {"Ports": {
+            "8501/tcp": [
+                {"HostIp": "0.0.0.0", "HostPort": "9000"},
+                {"HostIp": "127.0.0.1", "HostPort": "8501"},
+            ]
+        }}}
+        self.assertEqual(_extract_host_port(attrs), 8501)
+
+    def test_no_mapping_returns_none(self):
+        from fansly_manager.instances import _extract_host_port
+        self.assertIsNone(_extract_host_port({}))
+        self.assertIsNone(_extract_host_port({"NetworkSettings": {}}))
+        self.assertIsNone(_extract_host_port({"NetworkSettings": {"Ports": {}}}))
+        self.assertIsNone(_extract_host_port({"NetworkSettings": {"Ports": {"8501/tcp": None}}}))
+
+
+class TestManagerSafeWrappers(unittest.IsolatedAsyncioTestCase):
+    """Verifie que les safe_* catchent toutes les DockerException, pas
+    seulement NotFound — pour eviter qu'une erreur daemon crashe la page."""
+
+    async def test_safe_list_returns_error_on_docker_exception(self):
+        from unittest.mock import patch
+        from fansly_manager import instances as inst_mod
+
+        with patch.object(inst_mod, "_client") as mock_client:
+            mock_client.side_effect = RuntimeError("daemon unreachable")
+            result = inst_mod.safe_list_instances()
+            self.assertFalse(result.ok)
+            self.assertIn("daemon unreachable", result.error)
+
+    async def test_safe_list_returns_empty_on_total_failure(self):
+        # Compat alias list_instances() doit retourner [] sans crasher
+        # meme si _client() leve une exception non-NotFound.
+        from unittest.mock import patch
+        from fansly_manager import instances as inst_mod
+
+        with patch.object(inst_mod, "_client") as mock_client:
+            mock_client.side_effect = RuntimeError("boom")
+            self.assertEqual(inst_mod.list_instances(), [])
 
 
 # =================== entry point ===================

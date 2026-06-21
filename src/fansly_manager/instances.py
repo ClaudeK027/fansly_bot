@@ -4,34 +4,48 @@ Le manager tourne dans son propre container avec /var/run/docker.sock monte
 en bind (mode read-write pour pouvoir start/stop). Toutes les operations
 passent par le SDK docker-py.
 
-Convention de nommage des containers : ``fansly-bot-NAME`` (cf. docker-compose.yml).
+Convention de nommage des containers : ``fansly-bot-NAME`` (cf.
+docker-compose.yml). On reconnait aussi ``fansly-bot`` (sans suffixe)
+comme l'instance ``default`` pour la retro-compat single-instance.
+
+Toutes les operations exposees aux vues sont enveloppees dans des
+``safe_*`` qui catchent DockerException/APIError et retournent un
+``Result(ok, value, error)``. La vue n'a JAMAIS a gerer les exceptions
+docker-py, elle affiche juste error si ok=False.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from docker.models.containers import Container  # type: ignore[import-untyped]
 
 
-# Le manager lui-meme s'appelle "fansly-manager" -> on l'exclut des listings.
-# Le format attendu d'un container instance est "fansly-bot-NAME" ou NAME
-# matche la regex de --instance de init-env.sh (alphanumerique + underscore).
-# On reconnait aussi l'ancien format single-instance "fansly-bot" (sans
-# suffixe) comme l'instance "default" pour la retro-compat des deployments
-# qui n'ont pas encore migre vers le nommage multi-instance.
-_INSTANCE_NAME_RE = re.compile(r"^fansly-bot-(?P<name>[A-Za-z0-9_]+)$")
+# Convention : "fansly-bot-NAME" ou NAME = [A-Za-z0-9_]{1,64}. Borne haute
+# de 64 chars cap volontaire : empeche un attaquant local qui peut creer
+# des containers de flood l'UI avec un nom geant (defense-in-depth).
+_INSTANCE_NAME_RE = re.compile(r"^fansly-bot-(?P<name>[A-Za-z0-9_]{1,64})$")
+# Format legacy single-instance pre-multi-instance.
 _LEGACY_NAME_RE = re.compile(r"^fansly-bot$")
 
 
-def _docker():
-    """Import lazy de docker-py pour ne pas casser les tests dans un
-    environnement sans la lib installee (les tests qui ont besoin du SDK
-    sont skip ou utilisent un mock)."""
-    import docker  # type: ignore[import-untyped]
-    return docker
+T = TypeVar("T")
+
+
+@dataclass
+class Result(Generic[T]):
+    """Resultat d'une operation Docker, jamais une exception cote vue.
+
+    Pattern : ``ok, value, error = result`` (ou usage direct des fields).
+    Si ``ok`` est True, ``value`` contient le resultat ; sinon ``error``
+    contient un message lisible (pas une stack trace).
+    """
+
+    ok: bool
+    value: Optional[T] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -43,6 +57,8 @@ class Instance:
     status: str         # 'running' | 'exited' | 'paused' | 'restarting' | ...
     host_port: Optional[int]  # ex: 8501 (None si pas de mapping)
     image: str
+    # ISO 8601 timestamp du dernier StartedAt Docker (None si jamais demarre).
+    started_at: Optional[str] = None
 
     @property
     def is_running(self) -> bool:
@@ -50,74 +66,86 @@ class Instance:
 
     @property
     def dashboard_url(self) -> Optional[str]:
-        if self.host_port is None or not self.is_running:
+        # Validation defensive : port doit etre dans la plage non-privilegiee.
+        if self.host_port is None or not (1024 <= self.host_port <= 65535):
+            return None
+        if not self.is_running:
             return None
         return f"http://localhost:{self.host_port}"
 
 
+# ─── Helpers internes ────────────────────────────────────────────────────
+
+
+def _docker():
+    """Import lazy de docker-py."""
+    import docker  # type: ignore[import-untyped]
+    return docker
+
+
 def _client() -> Any:
-    """Retourne un client Docker base sur l'env (fonctionne avec le socket
-    monte en bind via /var/run/docker.sock)."""
+    """Retourne un client Docker base sur l'env."""
     return _docker().from_env()
 
 
-def _extract_host_port(container: "Container") -> Optional[int]:
-    """Recupere le port host mappe sur 8501/tcp (le port Streamlit interne)."""
+def _extract_host_port(container_attrs: dict) -> Optional[int]:
+    """Recupere le port host mappe sur 8501/tcp (port Streamlit interne).
+
+    Filtre par HostIp='127.0.0.1' en priorite (le binding attendu) pour
+    eviter de servir un IPv6 ou un 0.0.0.0 imprevu.
+    """
     try:
-        ports = container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
+        ports = container_attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
         mappings = ports.get("8501/tcp") or []
-        if mappings:
-            # Format Docker : [{"HostIp": "127.0.0.1", "HostPort": "8501"}, ...]
-            return int(mappings[0].get("HostPort"))
+        if not mappings:
+            return None
+        # Priorite : HostIp='127.0.0.1', sinon premier match
+        for m in mappings:
+            if (m.get("HostIp") or "").startswith("127.0.0.1"):
+                return int(m["HostPort"])
+        return int(mappings[0]["HostPort"])
     except (KeyError, ValueError, TypeError):
-        pass
-    return None
+        return None
 
 
-def list_instances() -> list[Instance]:
-    """Liste toutes les instances bot (running + stopped), triees par nom."""
-    client = _client()
-    instances: list[Instance] = []
-    for c in client.containers.list(all=True):
-        m = _INSTANCE_NAME_RE.match(c.name)
-        if m is not None:
-            name = m.group("name")
-        elif _LEGACY_NAME_RE.match(c.name):
-            # Container legacy single-instance pre-multi-instance.
-            name = "default"
-        else:
-            continue
-        instances.append(
-            Instance(
-                name=name,
-                container=c.name,
-                status=c.status,
-                host_port=_extract_host_port(c),
-                image=(c.image.tags[0] if c.image.tags else c.image.short_id),
-            )
-        )
-    instances.sort(key=lambda i: i.name)
-    return instances
+def _container_to_instance(c: "Container") -> Optional[Instance]:
+    """Convertit un Container docker-py en Instance, ou None si le nom ne
+    matche pas le pattern attendu (incluant le legacy ``fansly-bot``).
 
-
-def get_instance(name: str) -> Optional[Instance]:
-    """Recupere une instance par son nom (sans le prefixe ``fansly-bot-``)."""
-    for inst in list_instances():
-        if inst.name == name:
-            return inst
-    return None
+    Le ``c.attrs`` est passe une seule fois (docker-py inspect deja inclus
+    dans le listing) — pas de round-trip supplementaire.
+    """
+    name: Optional[str] = None
+    if (m := _INSTANCE_NAME_RE.match(c.name)) is not None:
+        name = m.group("name")
+    elif _LEGACY_NAME_RE.match(c.name):
+        name = "default"
+    else:
+        return None
+    started_at = c.attrs.get("State", {}).get("StartedAt") or None
+    return Instance(
+        name=name,
+        container=c.name,
+        status=c.status,
+        host_port=_extract_host_port(c.attrs),
+        image=(c.image.tags[0] if c.image.tags else c.image.short_id),
+        started_at=started_at,
+    )
 
 
 def _resolve_container_name(name: str) -> str:
     """Resout le nom de container Docker depuis le nom logique d'instance.
 
-    Pour "default", essaye d'abord le format moderne ``fansly-bot-default``
-    et fallback sur l'ancien ``fansly-bot`` si le moderne n'existe pas (cas
-    des deployments legacy non encore migres).
+    Pour ``default``, tente le format moderne ``fansly-bot-default`` puis
+    fallback sur l'ancien ``fansly-bot`` (retro-compat). Pour les autres
+    noms, retourne directement ``fansly-bot-NAME``.
+
+    Note : peut lever DockerException si le daemon est injoignable —
+    appele uniquement depuis les helpers safe_* qui catchent.
     """
-    client = _client()
     nf_exc = _docker().errors.NotFound
     modern = f"fansly-bot-{name}"
+    client = _client()
     try:
         client.containers.get(modern)
         return modern
@@ -129,37 +157,110 @@ def _resolve_container_name(name: str) -> str:
             return "fansly-bot"
         except nf_exc:
             pass
-    return modern  # par defaut on retourne le format moderne (NotFound a l'usage)
+    return modern  # NotFound a l'usage
+
+
+# ─── API publique (safe : aucune exception ne remonte) ───────────────────
+
+
+def _docker_exception_msg(e: Exception) -> str:
+    """Message lisible pour l'utilisateur a partir d'une DockerException."""
+    msg = str(e).strip() or e.__class__.__name__
+    # Truncate stack traces / json blobs
+    return msg.split("\n")[0][:200]
+
+
+def safe_list_instances() -> Result[list[Instance]]:
+    """Liste toutes les instances bot. Catch toute DockerException.
+
+    Returns:
+        Result(ok=True, value=[Instance, ...]) en cas de succes.
+        Result(ok=False, error="message lisible") si le daemon est
+        injoignable, permission refusee, etc.
+    """
+    try:
+        client = _client()
+        instances: list[Instance] = []
+        for c in client.containers.list(all=True):
+            inst = _container_to_instance(c)
+            if inst is not None:
+                instances.append(inst)
+        instances.sort(key=lambda i: i.name)
+        return Result(ok=True, value=instances)
+    except Exception as e:  # noqa: BLE001 — surface large voulue
+        return Result(ok=False, error=_docker_exception_msg(e))
+
+
+def safe_get_instance(name: str) -> Result[Optional[Instance]]:
+    """Recupere une instance par son nom logique. Single round-trip Docker."""
+    try:
+        client = _client()
+        try:
+            c = client.containers.get(_resolve_container_name(name))
+        except _docker().errors.NotFound:
+            return Result(ok=True, value=None)
+        return Result(ok=True, value=_container_to_instance(c))
+    except Exception as e:  # noqa: BLE001
+        return Result(ok=False, error=_docker_exception_msg(e))
+
+
+def safe_start_instance(name: str) -> Result[None]:
+    try:
+        client = _client()
+        c = client.containers.get(_resolve_container_name(name))
+        c.start()
+        return Result(ok=True)
+    except _docker().errors.NotFound:
+        return Result(ok=False, error=f"Container introuvable : {name}")
+    except Exception as e:  # noqa: BLE001
+        return Result(ok=False, error=_docker_exception_msg(e))
+
+
+def safe_stop_instance(name: str, timeout: int = 30) -> Result[None]:
+    """SIGTERM puis SIGKILL apres timeout seconds."""
+    try:
+        client = _client()
+        c = client.containers.get(_resolve_container_name(name))
+        c.stop(timeout=timeout)
+        return Result(ok=True)
+    except _docker().errors.NotFound:
+        return Result(ok=False, error=f"Container introuvable : {name}")
+    except Exception as e:  # noqa: BLE001
+        return Result(ok=False, error=_docker_exception_msg(e))
+
+
+def safe_restart_instance(name: str, timeout: int = 30) -> Result[None]:
+    try:
+        client = _client()
+        c = client.containers.get(_resolve_container_name(name))
+        c.restart(timeout=timeout)
+        return Result(ok=True)
+    except _docker().errors.NotFound:
+        return Result(ok=False, error=f"Container introuvable : {name}")
+    except Exception as e:  # noqa: BLE001
+        return Result(ok=False, error=_docker_exception_msg(e))
+
+
+# ─── Compat (anciens noms, gardent les meme contracts) ───────────────────
+# Les helpers safe_* sont la voie recommandee ; ces alias existent pour
+# les tests et toute API externe qui voudrait ignorer les erreurs.
+
+def list_instances() -> list[Instance]:
+    """Liste les instances (silencieux sur erreur, retourne [] si daemon KO)."""
+    return safe_list_instances().value or []
+
+
+def get_instance(name: str) -> Optional[Instance]:
+    return safe_get_instance(name).value
 
 
 def start_instance(name: str) -> bool:
-    """Demarre un container stoppe. Retourne True si OK, False si introuvable."""
-    client = _client()
-    try:
-        c = client.containers.get(_resolve_container_name(name))
-        c.start()
-        return True
-    except _docker().errors.NotFound:
-        return False
+    return safe_start_instance(name).ok
 
 
 def stop_instance(name: str, timeout: int = 30) -> bool:
-    """Stoppe gracieusement un container (SIGTERM puis SIGKILL apres timeout)."""
-    client = _client()
-    try:
-        c = client.containers.get(_resolve_container_name(name))
-        c.stop(timeout=timeout)
-        return True
-    except _docker().errors.NotFound:
-        return False
+    return safe_stop_instance(name, timeout).ok
 
 
 def restart_instance(name: str, timeout: int = 30) -> bool:
-    """Redemarre un container (preserve les volumes et la config)."""
-    client = _client()
-    try:
-        c = client.containers.get(_resolve_container_name(name))
-        c.restart(timeout=timeout)
-        return True
-    except _docker().errors.NotFound:
-        return False
+    return safe_restart_instance(name, timeout).ok
