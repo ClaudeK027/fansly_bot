@@ -10,8 +10,16 @@
 .pytest_cache/
 .ruff_cache/
 
-# Donnees runtime — montees via volume Docker, pas embarquees dans l image
+# Donnees runtime — montees via volume Docker, pas embarquees dans l image.
+# Multi-instance : chaque instance creee par le wizard ou new-instance.sh
+# stocke ses donnees (browser_profile, state.db, Medias) dans data-NAME/.
+# Ces dossiers contiennent des cookies de session Fansly = ne JAMAIS les
+# embarquer dans une image Docker.
 data/
+data-*/
+
+# Config override par instance (genere par setup-auth.sh ou wizard)
+config.*.yaml
 
 # Secrets — places sur le VPS via .env separe, jamais dans l image
 .env

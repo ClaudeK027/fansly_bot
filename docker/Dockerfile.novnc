@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7
+#
+# Image specialisee pour le wizard d'authentification a distance via noVNC.
+#
+# Contient :
+#   - Chromium + Playwright (via image officielle Playwright)
+#   - xvfb            : display virtuel X11 (pas besoin d'ecran physique)
+#   - x11vnc          : expose le display X11 en VNC sur localhost:5900
+#   - websockify      : bridge VNC TCP -> WebSocket pour noVNC
+#   - noVNC (web)     : client VNC JS, embedable en iframe
+#
+# Cycle de vie : le container est demarre A LA DEMANDE par le manager
+# (via docker SDK) au debut d'un wizard "Add account", et arrete des que
+# le login Fansly est confirme cote serveur. Pas de restart automatique.
+#
+# Volumes attendus :
+#   - /output  : ou le browser_profile/ sera ecrit a la fin du login
+#
+# Variables d'environnement :
+#   - FANSLY_USERNAME, FANSLY_PASSWORD, FANSLY_PROFILE_SLUG : credentials
+#   - INSTANCE_NAME : nom logique (informatif, pour les logs)
+#
+# Ports exposes :
+#   - 6080/tcp : noVNC web client (a tunneler depuis le poste user)
+
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DISPLAY=:99 \
+    NOVNC_PORT=6080
+
+# Installation des binaires X / VNC. noVNC est livre comme un dossier
+# de fichiers statiques (HTML + JS) sous /usr/share/novnc, websockify
+# est le bridge TCP -> WebSocket utilise par noVNC.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        xvfb \
+        x11vnc \
+        novnc \
+        websockify \
+        net-tools \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependances Python pour le script setup-auth-visual : pas besoin de
+# pyyaml/pydantic-settings, on lit les credentials depuis les env vars
+# que le manager nous transmet.
+RUN pip install --upgrade pip && \
+    pip install \
+        "playwright>=1.47.0" \
+        "playwright-stealth>=2.0.0" \
+        "structlog>=24.1.0"
+
+# Copie le script visual setup-auth (lancement Chromium visible + detection
+# login OK + sauvegarde du browser_profile dans /output).
+COPY docker/novnc/setup_auth_visual.py /app/setup_auth_visual.py
+
+# Entrypoint qui orchestre xvfb + x11vnc + websockify + Python.
+COPY docker/novnc/entrypoint.sh /usr/local/bin/entrypoint-novnc.sh
+RUN chmod +x /usr/local/bin/entrypoint-novnc.sh
+
+WORKDIR /app
+EXPOSE 6080
+
+# Pas de restart : on tourne UNE FOIS, on sort quand le login est fini.
+ENTRYPOINT ["/usr/local/bin/entrypoint-novnc.sh"]

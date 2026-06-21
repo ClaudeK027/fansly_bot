@@ -12,9 +12,28 @@
 #   ssh -L 8500:localhost:8500 user@vps
 #   puis http://localhost:8500
 #
-# Pour lancer le manager + une instance default ensemble :
-#   docker compose -f docker-compose.yml up -d --build              # instance bot default
-#   docker compose -f docker-compose.manager.yml --project-name fansly-manager up -d --build
+# ============================================================================
+# CONTRAINTES DE SECURITE NON-NEGOCIABLES (single-tenant uniquement)
+# ============================================================================
+# Le manager monte /var/run/docker.sock + le repo entier en RW. C'est
+# l'equivalent d'un acces root sur le VPS. En l'etat, il N'EST PAS prevu
+# pour le multi-operateur. Les regles suivantes DOIVENT etre respectees :
+#
+#   1. PORT 8500 : binding strict sur 127.0.0.1 (cf. ports: ci-dessous).
+#      Ne JAMAIS changer pour 0.0.0.0 ni exposer derriere reverse-proxy
+#      sans auth applicative.
+#
+#   2. ACCES : uniquement via tunnel SSH depuis le poste operateur.
+#      Pas de DNS public, pas de Cloudflare Tunnel, pas de Tailscale
+#      partage (sauf si la node Tailscale a une auth applicative).
+#
+#   3. WIZARD noVNC : ouvre des ports dynamiques dans 6080-6180 sur
+#      127.0.0.1. Le tunnel SSH initial ne les forward PAS — l'iframe
+#      du wizard affiche la commande SSH a executer pour ouvrir un
+#      2eme tunnel sur le port alloue par cette session.
+#
+# Tout ecart par rapport a ces contraintes = RCE root pre-auth sur l'hote.
+# ============================================================================
 
 # TODO Phase 5 — security hardening (a faire avant deploiement multi-operateur) :
 #   - Remplacer le bind direct de /var/run/docker.sock par un docker-socket-proxy
@@ -42,8 +61,28 @@ services:
     # acces root sur la machine hote via Docker.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Bind du repo ENTIER (read-write) : necessaire pour le wizard qui
+      # ecrit .env.NAME et lit/copie le Dockerfile.novnc au build.
+      # IN_CONTAINER_REPO_PATH=/host_repo => le code Python lit/ecrit ici.
+      # HOST_REPO_PATH (env) => path absolu cote daemon, passe en parametre
+      # aux docker run lancements de fansly-novnc / fansly-bot (qui font
+      # leurs propres bind mounts vers ce path host).
+      - "${HOST_REPO_PATH:-./}:/host_repo"
+
+    # Variables d'env :
+    # - HOST_REPO_PATH : path absolu HOST du repo, utilise par le
+    #   manager pour construire les --volume des docker run (le daemon
+    #   Docker resout les paths cote HOST, pas cote container manager).
+    # - IN_CONTAINER_REPO_PATH : path du repo VU PAR LE MANAGER (bind
+    #   mount ci-dessus). Utilise pour les operations file system du
+    #   wizard (write .env.NAME, lecture Dockerfile.novnc).
+    environment:
+      HOST_REPO_PATH: "${HOST_REPO_PATH:-${PWD}}"
+      IN_CONTAINER_REPO_PATH: "/host_repo"
 
     # Port host : 8500 (les instances bot sont sur 8501, 8502, ...)
+    # Plage 6080-6180 reservee aux containers noVNC du wizard (lances
+    # dynamiquement par le manager, pas mappes ici).
     # 127.0.0.1 uniquement — acces via tunnel SSH depuis le poste user.
     ports:
       - "127.0.0.1:8500:8500"

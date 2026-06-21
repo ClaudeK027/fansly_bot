@@ -20,7 +20,9 @@ import streamlit as st
 
 from fansly_manager import instances as inst_mod
 from fansly_manager import styles
+from fansly_manager import wizard as wiz_mod
 from fansly_manager.views import overview as overview_view
+from fansly_manager.views import wizard as wizard_view
 
 
 st.set_page_config(
@@ -32,6 +34,29 @@ st.set_page_config(
 )
 
 styles.inject()
+
+
+@st.cache_resource(show_spinner=False)
+def _boot_cleanup() -> Optional[str]:
+    """Garbage collector au demarrage du manager.
+
+    @st.cache_resource garantit UNE seule execution par process (pas un
+    par re-render). On supprime les containers fansly-novnc-* orphelins
+    crees lors de wizards interrompus (fermeture onglet, crash manager).
+
+    Retourne un message de log a afficher dans la sidebar si du cleanup
+    a eu lieu, None sinon.
+    """
+    result = wiz_mod.cleanup_stale_novnc_containers()
+    if result.ok and result.value:
+        return f"GC : {len(result.value)} container(s) noVNC orphelin(s) supprime(s)."
+    if not result.ok:
+        # Daemon down -> on laisse le _render_docker_error main gerer
+        return None
+    return None
+
+
+_BOOT_CLEANUP_MSG = _boot_cleanup()
 
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -67,6 +92,9 @@ def _render_sidebar(instances: list[inst_mod.Instance]) -> None:
     """Sidebar minimaliste : branding + navigation rapide (anchor HTML)."""
     st.sidebar.title("Fansly Manager")
     st.sidebar.caption("Pilotage central des bots")
+
+    if _BOOT_CLEANUP_MSG:
+        st.sidebar.caption(_BOOT_CLEANUP_MSG)
 
     st.sidebar.divider()
 
@@ -106,15 +134,17 @@ def _render_sidebar(instances: list[inst_mod.Instance]) -> None:
     _list_block("Arretes", stopped, "stopped")
 
     st.sidebar.divider()
-    st.sidebar.markdown(
-        '<div class="fm-sidebar-section">Ajouter un compte</div>',
-        unsafe_allow_html=True,
+    if st.sidebar.button(
+        "Ajouter un compte",
+        type="primary",
+        use_container_width=True,
+        key="nav_wizard",
+    ):
+        st.session_state["view"] = "wizard"
+        st.rerun()
+    st.sidebar.caption(
+        "Wizard guide avec login Fansly integre via noVNC."
     )
-    st.sidebar.code(
-        "./scripts/new-instance.sh NAME",
-        language="bash",
-    )
-    st.sidebar.caption("Wizard guide arrive en Phase 3 (noVNC).")
 
 
 def _render_docker_error(error_msg: str) -> None:
@@ -155,7 +185,12 @@ def main() -> None:
 
     instances = [_dict_to_inst(d) for d in instance_dicts]
     _render_sidebar(instances)
-    overview_view.render(instances)
+
+    view = st.session_state.get("view", "overview")
+    if view == "wizard":
+        wizard_view.render()
+    else:
+        overview_view.render(instances)
 
 
 main()
