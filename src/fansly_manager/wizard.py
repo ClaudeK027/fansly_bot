@@ -103,12 +103,54 @@ def _container_repo_root() -> Optional[Path]:
 # ─── Port allocation ─────────────────────────────────────────────────────
 
 
-def _find_free_port(start: int = 6080, end: int = 6180) -> Optional[int]:
-    """Trouve un port libre sur localhost pour exposer noVNC du wizard.
+def _ports_used_by_docker() -> set[int]:
+    """Liste les ports host deja mappes par des containers Docker.
 
-    On reste dans la plage 6080-6180 par convention (noVNC default = 6080).
+    Indispensable quand le manager tourne dans un container : le
+    ``socket.bind('127.0.0.1', X)`` teste la loopback DU CONTAINER MANAGER,
+    pas celle du host. Il faut donc interroger le daemon Docker pour
+    connaitre les bindings reels cote host.
+
+    Retourne un set vide si le daemon est inaccessible (best-effort —
+    l'erreur ressortira au docker run avec un message clair).
     """
+    used: set[int] = set()
+    try:
+        client = _client()
+        for c in client.containers.list(all=False):  # running only
+            ports = (c.attrs.get("NetworkSettings", {}) or {}).get("Ports") or {}
+            for _container_port, host_bindings in ports.items():
+                if not host_bindings:
+                    continue
+                for binding in host_bindings:
+                    host_port_str = binding.get("HostPort")
+                    if not host_port_str:
+                        continue
+                    try:
+                        used.add(int(host_port_str))
+                    except (ValueError, TypeError):
+                        continue
+    except Exception:  # noqa: BLE001
+        pass
+    return used
+
+
+def _find_free_port(start: int = 6080, end: int = 6180) -> Optional[int]:
+    """Trouve un port libre sur le host pour exposer noVNC du wizard.
+
+    Deux verifications complementaires :
+      1. ``_ports_used_by_docker()`` : ports bindes par des containers
+         Docker (source autoritative quand le manager est containerise).
+      2. ``socket.bind('127.0.0.1', port)`` : ports tenus par des
+         processus locaux (au sein du container manager ; sur le host
+         si manager hors docker).
+
+    On scanne 6080-6180 (plage reservee par convention).
+    """
+    docker_used = _ports_used_by_docker()
     for port in range(start, end):
+        if port in docker_used:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
@@ -551,9 +593,15 @@ def start_bot_instance(cfg: WizardConfig) -> Result[dict]:
         if repo is None:
             return Result(ok=False, error="HOST_REPO_PATH non defini.")
 
-        # Trouve un port host libre pour le dashboard Streamlit (8501-8599)
+        # Trouve un port host libre pour le dashboard Streamlit (8501-8599).
+        # Memes precautions que _find_free_port : on tient compte des ports
+        # deja bindes par d'autres containers Docker (le scan socket seul
+        # est aveugle quand le manager est containerise).
+        docker_used = _ports_used_by_docker()
         port: Optional[int] = None
         for p in range(8501, 8600):
+            if p in docker_used:
+                continue
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 try:
                     s.bind(("127.0.0.1", p))

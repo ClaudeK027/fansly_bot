@@ -251,61 +251,75 @@ def _step3_authenticate() -> None:
                 _go(2)
             return
 
-    # Le container tourne — affiche l'iframe noVNC
+    # Le container tourne — on EVITE l'iframe (bugs notoires : cache navigateur
+    # sur ERR_EMPTY_RESPONSE pendant le boot du container, blocage CSP/sandbox
+    # cross-port, faux negatifs en mode VPS). On expose un bouton qui ouvre
+    # le login dans un nouvel onglet, et on continue a poller le container
+    # cote serveur pour detecter le login confirme.
+    #
+    # IMPORTANT : on utilise 127.0.0.1 (pas localhost) dans l'URL noVNC car
+    # certains browsers/extensions (Brave Shields, uBlock origin) bloquent
+    # les WebSockets vers "localhost" mais laissent passer "127.0.0.1".
+    # Bug observe en E2E sur Brave avec uBlock : autoconnect ferme l'onglet
+    # apres 2s avec localhost, mais fonctionne immediatement avec 127.0.0.1.
     novnc_url = (
-        f"http://localhost:{session.host_port}/vnc.html"
+        f"http://127.0.0.1:{session.host_port}/vnc.html"
         "?autoconnect=1&resize=scale&reconnect=1"
     )
+    safe_url = html.escape(novnc_url)
 
-    # Si le manager est containerise (cas nominal VPS), l'URL localhost
-    # n'est pas joignable depuis le browser de l'user via le tunnel SSH
-    # existant (-L 8500 ne forward QUE 8500). On affiche la commande a
-    # executer pour ouvrir un 2eme tunnel sur le port dynamique alloue.
+    # Si le manager est containerise (cas VPS), l'URL 127.0.0.1 cote browser
+    # exige un 2eme tunnel SSH sur le port dynamique alloue.
     if _running_in_container():
         tunnel_cmd = (
-            f"ssh -L {session.host_port}:localhost:{session.host_port} "
+            f"ssh -L {session.host_port}:127.0.0.1:{session.host_port} "
             f"<user>@<vps>"
         )
         st.info(
-            "**Acces a l'iframe noVNC en mode VPS** : si tu connectes le "
-            "manager via tunnel SSH (`-L 8500:localhost:8500`), tu dois "
-            "ouvrir UN SECOND TUNNEL pour le port dynamique de cette "
-            "session :\n\n"
+            "**Mode VPS** : si tu connectes le manager via tunnel SSH "
+            "(`-L 8500:localhost:8500`), ouvre **maintenant** un 2eme "
+            "tunnel pour le port dynamique de cette session :\n\n"
             f"```bash\n{tunnel_cmd}\n```\n"
-            "Garde-le ouvert le temps du login. Si tu es deja sur la meme "
-            "machine que le manager (acces local), ignore ce message — "
-            "l'iframe se chargera directement."
+            "Une fois le tunnel ouvert, clique le bouton ci-dessous. "
+            "Si tu es deja sur la meme machine que le manager, le bouton "
+            "fonctionnera directement."
         )
 
     st.markdown(
         '<div class="fm-empty-body" style="margin-bottom:16px;">'
-        "Fais ton login Fansly dans la fenetre ci-dessous "
-        "(Cloudflare et 2FA fonctionnent normalement). Une fois sur la "
-        "page d'accueil Fansly, le wizard passera automatiquement a "
-        "l'etape suivante."
+        "Ouvre la fenetre de login dans un nouvel onglet. Cloudflare et 2FA "
+        "fonctionnent normalement. Une fois ton login termine sur la page "
+        "d'accueil Fansly, **reviens dans cet onglet** : le wizard "
+        "detectera automatiquement le succes et passera a l'etape suivante "
+        "(rafraichissement automatique toutes les 3s ou via le bouton "
+        "'Verifier'). Tu peux ensuite fermer l'onglet de login."
         "</div>",
         unsafe_allow_html=True,
     )
 
-    # iframe noVNC. Hauteur generuese pour confort de login.
-    safe_url = html.escape(novnc_url)
+    # Bouton principal : ouvre noVNC dans un nouvel onglet (rel=noopener pour
+    # isolation, target=_blank pour eviter de perdre la session_state du wizard).
     st.markdown(
-        f'<iframe src="{safe_url}" '
-        f'style="width:100%;height:720px;border:1px solid var(--fm-border);'
-        f'border-radius:var(--fm-radius);background:#000;"></iframe>',
+        f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
+        f'class="fm-btn-primary" '
+        f'style="display:inline-block;padding:12px 24px;background:var(--fm-green);'
+        f'color:#fff;border-radius:var(--fm-radius);text-decoration:none;'
+        f'font-weight:600;margin-bottom:16px;">'
+        f'Ouvrir la fenetre de login Fansly</a>',
         unsafe_allow_html=True,
     )
 
-    st.caption(
-        "L'iframe se reconnecte automatiquement si la connexion se perd. "
-        "Si elle reste noire >10s, recharge la page entiere."
+    # Auto-refresh leger : meta refresh toutes les 3s tant qu'on est sur step 3.
+    # Pas de dependance externe, comportement deterministe. Le browser
+    # n'incremente PAS l'historique sur meta refresh same-URL.
+    st.markdown(
+        '<meta http-equiv="refresh" content="3">',
+        unsafe_allow_html=True,
     )
 
-    # Auto-refresh : Streamlit n'a pas de poll natif. On utilise un bouton
-    # "Verifier" et on documente. Une alternative serait st_autorefresh.
     c1, c2 = st.columns([1, 4])
     with c1:
-        if st.button("Verifier l'avancement", use_container_width=True):
+        if st.button("Verifier maintenant", use_container_width=True):
             st.rerun()
     with c2:
         if st.button("Annuler et nettoyer", type="secondary"):
