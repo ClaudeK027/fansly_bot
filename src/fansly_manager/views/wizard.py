@@ -289,16 +289,19 @@ def _step3_authenticate() -> None:
         '<div class="fm-empty-body" style="margin-bottom:16px;">'
         "Ouvre la fenetre de login dans un nouvel onglet. Cloudflare et 2FA "
         "fonctionnent normalement. Une fois ton login termine sur la page "
-        "d'accueil Fansly, **reviens dans cet onglet** : le wizard "
-        "detectera automatiquement le succes et passera a l'etape suivante "
-        "(rafraichissement automatique toutes les 3s ou via le bouton "
-        "'Verifier'). Tu peux ensuite fermer l'onglet de login."
+        "d'accueil Fansly, <b>reviens dans cet onglet</b> et clique le "
+        "bouton <b>\"J'ai termine mon login\"</b>. Tu peux ensuite fermer "
+        "l'onglet de login."
         "</div>",
         unsafe_allow_html=True,
     )
 
     # Bouton principal : ouvre noVNC dans un nouvel onglet (rel=noopener pour
     # isolation, target=_blank pour eviter de perdre la session_state du wizard).
+    # NOTE : pas de meta refresh automatique — provoque un reload complet de la
+    # page wizard toutes les 3s, ce qui donne l'impression a l'utilisateur que
+    # l'interface "clignote" ou "se referme". L'user clique manuellement le
+    # bouton de verification quand son login est fini.
     st.markdown(
         f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer" '
         f'class="fm-btn-primary" '
@@ -309,20 +312,22 @@ def _step3_authenticate() -> None:
         unsafe_allow_html=True,
     )
 
-    # Auto-refresh leger : meta refresh toutes les 3s tant qu'on est sur step 3.
-    # Pas de dependance externe, comportement deterministe. Le browser
-    # n'incremente PAS l'historique sur meta refresh same-URL.
-    st.markdown(
-        '<meta http-equiv="refresh" content="3">',
-        unsafe_allow_html=True,
-    )
-
-    c1, c2 = st.columns([1, 4])
+    c1, c2 = st.columns([1, 1])
     with c1:
-        if st.button("Verifier maintenant", use_container_width=True):
+        if st.button(
+            "J'ai termine mon login",
+            type="primary",
+            use_container_width=True,
+            key="step3_done",
+        ):
             st.rerun()
     with c2:
-        if st.button("Annuler et nettoyer", type="secondary"):
+        if st.button(
+            "Annuler et nettoyer",
+            type="secondary",
+            use_container_width=True,
+            key="step3_cancel",
+        ):
             wiz.cleanup_auth_container(session.container_id)
             _reset()
             st.session_state["view"] = "overview"
