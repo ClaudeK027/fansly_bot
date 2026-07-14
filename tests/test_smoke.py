@@ -16,6 +16,7 @@ Couvre :
 from __future__ import annotations
 
 import os
+import random
 import shutil
 import sqlite3
 import sys
@@ -1147,6 +1148,944 @@ class TestManagerSafeWrappers(unittest.IsolatedAsyncioTestCase):
         with patch.object(inst_mod, "_client") as mock_client:
             mock_client.side_effect = RuntimeError("boom")
             self.assertEqual(inst_mod.list_instances(), [])
+
+    def test_container_to_instance_reads_image_from_attrs_no_lazy_inspect(self):
+        # Regression : un container dont l'image a ete supprimee ne doit PAS
+        # declencher de lazy c.image (GET /images/<id>/json -> 404). On lit
+        # depuis c.attrs. Acceder a .image sur ce mock leverait une erreur.
+        from fansly_manager import instances as inst_mod
+
+        class _DeadImageContainer:
+            name = "fansly-bot-marie"
+            status = "exited"
+            attrs = {
+                "State": {"StartedAt": "2026-07-01T00:00:00Z"},
+                "Image": "sha256:5a8c4e33eaffa0119d7715c2a989a3f696e40ae10",
+                "Config": {"Image": "fansly-bot:latest"},
+                "NetworkSettings": {"Ports": {}},
+            }
+
+            @property
+            def image(self):  # simule le 404 lazy de docker-py
+                raise RuntimeError("404 No such image: sha256:5a8c4e33")
+
+        inst = inst_mod._container_to_instance(_DeadImageContainer())
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.name, "marie")
+        self.assertEqual(inst.image, "fansly-bot:latest")  # depuis attrs, pas .image
+
+    def test_safe_list_skips_container_that_raises(self):
+        # Un container dont la conversion leve NE DOIT PAS faire echouer
+        # toute la liste : il est skip, les autres passent.
+        from unittest.mock import patch
+        from fansly_manager import instances as inst_mod
+
+        class _GoodContainer:
+            name = "fansly-bot-ok"
+            status = "running"
+            attrs = {
+                "State": {"StartedAt": "2026-07-01T00:00:00Z"},
+                "Image": "sha256:abc123",
+                "Config": {"Image": "fansly-bot:latest"},
+                "NetworkSettings": {"Ports": {"8501/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8503"}]}},
+            }
+            image = None  # pas utilise (on lit attrs)
+
+        class _PoisonContainer:
+            name = "fansly-bot-poison"
+            # attrs manquant -> _container_to_instance leve dans le corps
+            @property
+            def attrs(self):
+                raise RuntimeError("attrs corrompus")
+            status = "exited"
+
+        class _FakeClient:
+            def __init__(self, containers):
+                self._containers = containers
+            class _C:
+                pass
+            @property
+            def containers(self):
+                outer = self
+                class _Containers:
+                    def list(self, all=False):
+                        return outer._containers
+                return _Containers()
+
+        fake = _FakeClient([_GoodContainer(), _PoisonContainer()])
+        with patch.object(inst_mod, "_client", return_value=fake):
+            result = inst_mod.safe_list_instances()
+        self.assertTrue(result.ok, f"la liste ne doit pas echouer, got {result.error}")
+        names = [i.name for i in result.value]
+        self.assertIn("ok", names)
+        self.assertNotIn("poison", names)  # le container fautif est skip
+
+
+# ============================================================
+# Playlist ordonnee (rotation batch avec ordre fige au cycle 1)
+# ============================================================
+
+
+class TestPlaylistOrderState(_TmpStateMixin, unittest.TestCase):
+    """Tests unitaires de la persistence playlist_order dans state.py."""
+
+    def _fresh_store(self):
+        from fansly_bot.infra.state import StateStore
+        self.store = StateStore(self.settings)
+        return self.store
+
+    def test_new_batch_has_empty_playlist(self):
+        store = self._fresh_store()
+        store.start_batch("perla_10", max_cycles=3)
+        batch = store.get_active_batch()
+        self.assertEqual(batch.playlist_order, [])
+
+    def test_set_playlist_order_persists(self):
+        store = self._fresh_store()
+        store.start_batch("perla_10")
+        playlist = ["c.mp4", "a.mp4", "b.mp4"]
+        store.set_batch_playlist_order(playlist)
+        # Re-lire pour verifier la persistance
+        batch = store.get_active_batch()
+        self.assertEqual(batch.playlist_order, playlist)
+
+    def test_advance_cycle_preserves_playlist(self):
+        store = self._fresh_store()
+        store.start_batch("perla_10", max_cycles=5)
+        playlist = ["m3.mp4", "m1.mp4", "m2.mp4"]
+        store.set_batch_playlist_order(playlist)
+        store.add_to_batch_published("m3.mp4")
+        # Cycle 1 -> 2
+        store.advance_batch_cycle(2)
+        batch = store.get_active_batch()
+        self.assertEqual(batch.current_cycle, 2)
+        self.assertEqual(batch.published_in_cycle, [], "published_in_cycle doit etre reset")
+        self.assertEqual(batch.playlist_order, playlist, "playlist_order doit etre preserve")
+
+    def test_get_published_post_ids_in_window(self):
+        # Purge par IDs stockes : fenetre INCLUSIVE, exclut hors-fenetre et
+        # posts sans fansly_post_id. Robuste au format tz/precision (DATE()).
+        store = self._fresh_store()
+        conn = store._conn
+        rows = [
+            (1, "b", 1, "a.mp4", "2026-07-01T00:34:32.1+00:00", "cap", "111"),
+            (1, "b", 1, "b.mp4", "2026-07-02T22:36:20+00:00", "cap", "222"),
+            (1, "b", 1, "c.mp4", "2026-07-03T05:00:00+00:00", "cap", "333"),  # hors
+            (1, "b", 1, "d.mp4", "2026-07-01T10:00:00+00:00", "cap", None),   # sans id
+        ]
+        for r in rows:
+            conn.execute(
+                "INSERT INTO media_published (run_id,batch_name,cycle_number,"
+                "media_filename,published_at,caption_used,fansly_post_id) "
+                "VALUES (?,?,?,?,?,?,?)", r,
+            )
+        conn.commit()
+        res = store.get_published_post_ids_in_window(
+            "2026-07-01T00:00:00+00:00", "2026-07-02T23:59:59+00:00"
+        )
+        self.assertEqual([x[0] for x in res], ["111", "222"])
+
+    def test_new_batch_resets_playlist(self):
+        store = self._fresh_store()
+        store.start_batch("batch_a")
+        store.set_batch_playlist_order(["a.mp4", "b.mp4"])
+        # Nouveau batch : la playlist doit etre remise a zero
+        store.start_batch("batch_b")
+        batch = store.get_active_batch()
+        self.assertEqual(batch.name, "batch_b")
+        self.assertEqual(batch.playlist_order, [])
+
+    def test_add_to_batch_published_does_not_touch_playlist(self):
+        store = self._fresh_store()
+        store.start_batch("perla_10")
+        playlist = ["x.mp4", "y.mp4"]
+        store.set_batch_playlist_order(playlist)
+        store.add_to_batch_published("x.mp4")
+        batch = store.get_active_batch()
+        self.assertEqual(batch.playlist_order, playlist)
+        self.assertEqual(batch.published_in_cycle, ["x.mp4"])
+
+    def test_migration_alter_table_adds_playlist_order(self):
+        """DB pre-migration -> ouverture ajoute la colonne automatiquement."""
+        # 1) Cree une DB avec active_batch SANS playlist_order (schema legacy)
+        conn = sqlite3.connect(str(self.settings.paths.state_db))
+        conn.execute("""
+            CREATE TABLE active_batch (
+                id                 INTEGER PRIMARY KEY CHECK (id = 1),
+                name               TEXT NOT NULL,
+                started_at         TEXT NOT NULL,
+                max_cycles         INTEGER NOT NULL DEFAULT 0,
+                current_cycle      INTEGER NOT NULL DEFAULT 1,
+                published_in_cycle TEXT NOT NULL DEFAULT '[]',
+                total_published    INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            INSERT INTO active_batch
+                (id, name, started_at, max_cycles, current_cycle,
+                 published_in_cycle, total_published)
+            VALUES (1, 'legacy', '2026-06-25T00:00:00+00:00', 5, 3, '["a.mp4"]', 10)
+        """)
+        # job_queue legacy avec un job publish : la migration run_id backfille
+        # l'active_batch depuis l'id du dernier job publish (comme en prod, ou
+        # un lot est toujours pilote par un job). Sans job publish, la migration
+        # supprimerait l'active_batch (stop propre) — comportement voulu mais
+        # non representatif d'un vrai upgrade en cours de lot.
+        conn.execute("""
+            CREATE TABLE job_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
+                config TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
+                started_at TEXT, finished_at TEXT, log_path TEXT, error TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO job_queue (id, type, config, status, created_at) "
+            "VALUES (42, 'publish', '{}', 'running', '2026-06-25T00:00:00+00:00')"
+        )
+        conn.commit()
+        # Verifier absence pre-migration
+        cols_before = [
+            r[1] for r in conn.execute("PRAGMA table_info(active_batch)").fetchall()
+        ]
+        self.assertNotIn("playlist_order", cols_before)
+        self.assertNotIn("run_id", cols_before)
+        conn.close()
+
+        # 2) Ouvrir avec StateStore : les migrations ALTER TABLE doivent s'appliquer
+        store = self._fresh_store()
+
+        conn = sqlite3.connect(str(self.settings.paths.state_db))
+        cols_after = [
+            r[1] for r in conn.execute("PRAGMA table_info(active_batch)").fetchall()
+        ]
+        self.assertIn("playlist_order", cols_after)
+        self.assertIn("run_id", cols_after)
+        conn.close()
+
+        # 3) Le batch legacy est preserve, playlist_order par defaut = [],
+        #    run_id backfille depuis le dernier job publish (id 42).
+        batch = store.get_active_batch()
+        self.assertEqual(batch.name, "legacy")
+        self.assertEqual(batch.current_cycle, 3)
+        self.assertEqual(batch.published_in_cycle, ["a.mp4"])
+        self.assertEqual(batch.playlist_order, [])
+        self.assertEqual(batch.run_id, 42)
+
+
+class TestSelectNextMedia(unittest.TestCase):
+    """Tests unitaires de la fonction pure de selection Uploader._select_next_media."""
+
+    def setUp(self):
+        # Import a l'interieur pour eviter le cout d'import si tests non lances
+        from fansly_bot.services.uploader import UploaderService
+        self.select = UploaderService._select_next_media
+        # RNG deterministe pour reproductibilite des shuffles
+        self.rng = random.Random(42)
+
+    def test_cycle_1_initializes_playlist_with_shuffle(self):
+        """1er cycle : playlist vide -> shuffle initial persistee."""
+        disk = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+        media, new_playlist, event = self.select(
+            current_playlist=[],
+            disk_names_sorted=disk,
+            published_in_cycle=[],
+            rng=self.rng,
+        )
+        self.assertEqual(event, "init")
+        # La playlist contient tous les fichiers du disque, dans un ordre potentiellement different
+        self.assertEqual(sorted(new_playlist), sorted(disk))
+        # Le media picke est le 1er de la playlist shuffle
+        self.assertEqual(media, new_playlist[0])
+
+    def test_cycle_2_follows_frozen_order(self):
+        """Cycle 2+ : playlist existante, published_in_cycle vide (reset) -> premier de la playlist."""
+        playlist = ["c.mp4", "a.mp4", "d.mp4", "b.mp4"]
+        disk = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+        media, new_playlist, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=disk,
+            published_in_cycle=[],
+            rng=self.rng,
+        )
+        self.assertEqual(event, "unchanged")
+        self.assertEqual(new_playlist, playlist)
+        self.assertEqual(media, "c.mp4", "Doit prendre le 1er de la playlist")
+
+    def test_mid_cycle_skips_already_published(self):
+        """Milieu de cycle : c.mp4 deja publie -> prendre a.mp4 (2eme de la playlist)."""
+        playlist = ["c.mp4", "a.mp4", "d.mp4", "b.mp4"]
+        disk = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+        media, _, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=disk,
+            published_in_cycle=["c.mp4"],
+            rng=self.rng,
+        )
+        self.assertEqual(event, "unchanged")
+        self.assertEqual(media, "a.mp4")
+
+    def test_A1_new_file_appended_to_end(self):
+        """A1 : nouveau fichier sur disque, absent de playlist -> ajoute a la FIN."""
+        playlist = ["c.mp4", "a.mp4", "b.mp4"]
+        disk = ["a.mp4", "b.mp4", "c.mp4", "e.mp4", "f.mp4"]  # e et f sont nouveaux
+        media, new_playlist, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=disk,
+            published_in_cycle=["c.mp4", "a.mp4", "b.mp4"],  # les 3 originaux deja publies
+            rng=self.rng,
+        )
+        self.assertEqual(event, "extend")
+        # Les 3 premiers restent dans l'ordre initial
+        self.assertEqual(new_playlist[:3], ["c.mp4", "a.mp4", "b.mp4"])
+        # e et f sont a la fin, en ordre alphabetique stable (pas de shuffle)
+        self.assertEqual(new_playlist[3:], ["e.mp4", "f.mp4"])
+        # Media picke : e (le premier nouveau, tous les autres deja publies)
+        self.assertEqual(media, "e.mp4")
+
+    def test_A1_multiple_new_files_ordered_alphabetically(self):
+        """A1 : plusieurs nouveaux fichiers -> ordre alphabetique stable."""
+        playlist = ["a.mp4"]
+        disk = ["a.mp4", "z.mp4", "b.mp4", "m.mp4"]
+        _, new_playlist, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=sorted(disk),  # disk arrive deja trie
+            published_in_cycle=[],
+            rng=self.rng,
+        )
+        self.assertEqual(event, "extend")
+        self.assertEqual(new_playlist, ["a.mp4", "b.mp4", "m.mp4", "z.mp4"])
+
+    def test_B1_missing_file_skipped_silently(self):
+        """B1 : c.mp4 dans la playlist mais absent du disque -> saute, prend le suivant."""
+        playlist = ["c.mp4", "a.mp4", "d.mp4"]
+        disk = ["a.mp4", "d.mp4"]  # c.mp4 disparu
+        media, new_playlist, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=disk,
+            published_in_cycle=[],
+            rng=self.rng,
+        )
+        # La playlist n'est pas modifiee : on garde c.mp4 pour compatibilite future
+        # (si le fichier reapparait, il sera repris)
+        self.assertEqual(new_playlist, playlist)
+        self.assertEqual(event, "unchanged")
+        # Le pick saute c.mp4 et prend a.mp4
+        self.assertEqual(media, "a.mp4")
+
+    def test_playlist_exhausted_returns_none(self):
+        """Tous les fichiers de la playlist sont publies OU disparus -> None."""
+        playlist = ["a.mp4", "b.mp4"]
+        disk = ["a.mp4"]  # b.mp4 disparu
+        media, _, event = self.select(
+            current_playlist=playlist,
+            disk_names_sorted=disk,
+            published_in_cycle=["a.mp4"],  # a.mp4 publie ce cycle
+            rng=self.rng,
+        )
+        self.assertIsNone(media)
+        self.assertEqual(event, "exhausted")
+
+    def test_deterministic_order_across_full_batch_lifecycle(self):
+        """Simulation E2E : 3 medias, 2 cycles complets. L'ordre est identique."""
+        disk = ["m1.mp4", "m2.mp4", "m3.mp4"]
+
+        # Cycle 1 : init + publier les 3
+        rng = random.Random(42)
+        published = []
+        picks_cycle_1 = []
+        playlist = []
+        for _ in range(3):
+            media, playlist, _ = self.select(
+                current_playlist=playlist,
+                disk_names_sorted=disk,
+                published_in_cycle=published,
+                rng=rng,
+            )
+            picks_cycle_1.append(media)
+            published.append(media)
+
+        # Cycle 2 : published reset, meme playlist -> meme ordre
+        published_cycle_2 = []
+        picks_cycle_2 = []
+        for _ in range(3):
+            media, playlist, _ = self.select(
+                current_playlist=playlist,
+                disk_names_sorted=disk,
+                published_in_cycle=published_cycle_2,
+                rng=rng,
+            )
+            picks_cycle_2.append(media)
+            published_cycle_2.append(media)
+
+        self.assertEqual(
+            picks_cycle_1, picks_cycle_2,
+            f"L'ordre du cycle 2 doit etre identique au cycle 1. "
+            f"Cycle1={picks_cycle_1} Cycle2={picks_cycle_2}"
+        )
+
+
+# ============================================================
+# Reprise apres crash (Phase A) — machine a etats anti-doublon
+# ============================================================
+
+
+class TestCrashResume(_TmpStateMixin, unittest.TestCase):
+    """Tests LOGIQUE de la reprise-apres-crash. Le 'crash' est simule en
+    amenant la DB dans son etat residuel (via les primitives write-ahead)
+    puis en fermant/rouvrant le StateStore et en appelant la reconciliation.
+    Aucun Docker, aucun navigateur, aucun compte Fansly."""
+
+    def _fresh_store(self):
+        from fansly_bot.infra.state import StateStore
+        self.store = StateStore(self.settings)
+        return self.store
+
+    def _crash_reopen(self):
+        """Simule un kill du worker : ferme puis rouvre le StateStore sur la
+        meme DB (etat exactement residuel apres crash)."""
+        self.store.close()
+        return self._fresh_store()
+
+    def _enqueue_running_publish(self, store, batch="b"):
+        jid = store.enqueue_job("publish", {"batch_name": batch, "max_cycles": 0})
+        store._conn.execute("UPDATE job_queue SET status='running' WHERE id=?", (jid,))
+        store._conn.commit()
+        return jid
+
+    # ---- CP1 : clicked=0 => aucun POST parti => republier, aucune perte ----
+    def test_cp1_clicked0_republishes_no_loss(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 1, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")  # write-ahead
+        # clicked reste 0 : le clic Post n'a jamais ete emis
+        s = self._crash_reopen()
+        counts = s.reconcile_publish_in_flight()
+        self.assertEqual(counts["republish"], 1)
+        # m1 NON marque publie -> reste pending -> sera republie (pas de perte)
+        self.assertNotIn("m1.mp4", s.get_active_batch().published_in_cycle)
+        self.assertEqual(s.list_orphan_in_flight(), [])
+        n = s._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='m1.mp4'"
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    # ---- CP2/CP3b : clicked=1 sans id => skip conservateur, jamais republier ----
+    def test_cp2_clicked1_no_id_skip_never_republish(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "m1.mp4")  # clic emis, id JAMAIS capture
+        s = self._crash_reopen()
+        counts = s.reconcile_publish_in_flight()
+        self.assertEqual(counts["ambiguous_zombie"], 1)
+        # marque publie (skip) : dans published_in_cycle, in_flight vide
+        self.assertIn("m1.mp4", s.get_active_batch().published_in_cycle)
+        self.assertEqual(s.list_orphan_in_flight(), [])
+        # media_published avec id NULL (zombie potentiel, non rotable)
+        row = s._conn.execute(
+            "SELECT fansly_post_id FROM media_published WHERE media_filename='m1.mp4'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+
+    # ---- CP3 : clicked=1 + id => publie confirme, une seule ligne ----
+    def test_cp3_clicked1_with_id_confirmed(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "m1.mp4")
+        s.set_in_flight_post_id(rid, "b", 1, "m1.mp4", "POST_M1")  # id persiste
+        s = self._crash_reopen()
+        counts = s.reconcile_publish_in_flight()
+        self.assertEqual(counts["confirmed"], 1)
+        n = s._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='m1.mp4' "
+            "AND fansly_post_id='POST_M1'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+        self.assertIn("m1.mp4", s.get_active_batch().published_in_cycle)
+        self.assertEqual(s.list_orphan_in_flight(), [])
+
+    # ---- CP4/CP7 : reconcile idempotent (re-run) sans double-count ----
+    def test_cp4_cp7_reconcile_idempotent_no_double_count(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4"])
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "m1.mp4")
+        s.set_in_flight_post_id(rid, "b", 1, "m1.mp4", "POST_M1")
+        s = self._crash_reopen()
+        s.reconcile_publish_in_flight()
+        total1 = s.get_active_batch().total_published
+        # re-run reconcile (crash pendant reconcile -> re-execute au boot suivant)
+        s.reconcile_publish_in_flight()
+        total2 = s.get_active_batch().total_published
+        self.assertEqual(total1, total2, "total_published double-compte a la reapplication")
+        n = s._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='m1.mp4'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    # ---- CP6 : orphelin d'un cycle anterieur non ajoute au cycle courant ----
+    def test_cp6_prev_cycle_orphan_not_added_to_current_cycle(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        # le batch est au cycle 2, mais l'orphelin porte le cycle 1
+        s._conn.execute("UPDATE active_batch SET current_cycle=2 WHERE id=1")
+        s._conn.commit()
+        s.mark_publish_in_flight(rid, "b", 1, "old.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "old.mp4")
+        s.set_in_flight_post_id(rid, "b", 1, "old.mp4", "POST_OLD")
+        s = self._crash_reopen()
+        s.reconcile_publish_in_flight()
+        # record fait (sous cycle 1) mais PAS ajoute au published_in_cycle du cycle 2
+        self.assertNotIn("old.mp4", s.get_active_batch().published_in_cycle)
+        n = s._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='old.mp4' "
+            "AND cycle_number=1"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    # ---- CP8 : requeue + resume preserve la position ----
+    def test_cp8_requeue_resumes_position(self):
+        s = self._fresh_store()
+        jid = self._enqueue_running_publish(s, "b")
+        rid = s.start_or_resume_batch("b", 0, jid)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4", "m3.mp4"])
+        s.add_to_batch_published("m1.mp4")
+        s = self._crash_reopen()
+        # boot : reconcile_stale_jobs doit REQUEUE le job publish running
+        counts = s.reconcile_stale_jobs()
+        self.assertEqual(counts["publish_requeued"], 1)
+        job_status = s._conn.execute(
+            "SELECT status FROM job_queue WHERE id=?", (jid,)
+        ).fetchone()[0]
+        self.assertEqual(job_status, "queued")
+        # cleanup ne doit PAS supprimer l'active_batch (un job publish est queued)
+        self.assertIsNone(s.cleanup_orphan_active_batch())
+        # resume : run_id + position preserves
+        rid2 = s.start_or_resume_batch("b", 0, 999)
+        self.assertEqual(rid2, rid, "resume doit garder le run_id d'origine")
+        ab = s.get_active_batch()
+        self.assertEqual(ab.published_in_cycle, ["m1.mp4"])
+        self.assertEqual(ab.playlist_order, ["m1.mp4", "m2.mp4", "m3.mp4"])
+
+    # ---- CP-PURGE : job purge interrompu => failed ----
+    def test_cppurge_stale_purge_marked_failed(self):
+        s = self._fresh_store()
+        jid = s.enqueue_job("purge", {"dry_run": False})
+        s._conn.execute("UPDATE job_queue SET status='running' WHERE id=?", (jid,))
+        s._conn.commit()
+        s = self._crash_reopen()
+        counts = s.reconcile_stale_jobs()
+        self.assertEqual(counts["purge_failed"], 1)
+        row = s._conn.execute(
+            "SELECT status, error FROM job_queue WHERE id=?", (jid,)
+        ).fetchone()
+        self.assertEqual(row[0], "failed")
+        self.assertIn("recovered_from_crash", row[1])
+
+    # ---- publish 'cancelling' => cancelled (respect intention utilisateur) ----
+    def test_publish_cancelling_becomes_cancelled(self):
+        s = self._fresh_store()
+        jid = self._enqueue_running_publish(s, "b")
+        s._conn.execute("UPDATE job_queue SET status='cancelling' WHERE id=?", (jid,))
+        s._conn.commit()
+        s = self._crash_reopen()
+        counts = s.reconcile_stale_jobs()
+        self.assertEqual(counts["publish_cancelled"], 1)
+        self.assertEqual(
+            s._conn.execute("SELECT status FROM job_queue WHERE id=?", (jid,)).fetchone()[0],
+            "cancelled",
+        )
+
+    # ---- Hole 5 : reconcile avec active_batch=None ne crashe pas ----
+    def test_reconcile_no_active_batch_does_not_crash(self):
+        s = self._fresh_store()
+        # in_flight orphelin SANS active_batch (batch stoppe avant le crash)
+        s.mark_publish_in_flight(777, "gone", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(777, "gone", 1, "m1.mp4")
+        s.set_in_flight_post_id(777, "gone", 1, "m1.mp4", "POST_X")
+        self.assertIsNone(s.get_active_batch())
+        s = self._crash_reopen()
+        # ne doit PAS lever (skip add_to_batch_published, garde record+clear)
+        counts = s.reconcile_publish_in_flight()
+        self.assertEqual(counts["confirmed"], 1)
+        self.assertEqual(s.list_orphan_in_flight(), [])  # clear effectue
+
+    # ---- Hole 9 : add_to_batch_published idempotent (total non gonfle) ----
+    def test_add_to_batch_published_idempotent_total(self):
+        s = self._fresh_store()
+        s.start_or_resume_batch("b", 0, 100)
+        s.add_to_batch_published("m1.mp4")
+        t1 = s.get_active_batch().total_published
+        s.add_to_batch_published("m1.mp4")  # reapplication
+        t2 = s.get_active_batch().total_published
+        self.assertEqual(t1, t2)
+        self.assertEqual(t1, 1)
+
+    # ---- Hole 10 : 'cancelling' orphelin balaye en 'cancelled' ----
+    def test_sweep_stale_cancelling(self):
+        s = self._fresh_store()
+        jid = s.enqueue_job("publish", {"batch_name": "b"})
+        s._conn.execute("UPDATE job_queue SET status='cancelling' WHERE id=?", (jid,))
+        s._conn.commit()
+        n = s.sweep_stale_cancelling()
+        self.assertEqual(n, 1)
+        self.assertEqual(
+            s._conn.execute("SELECT status FROM job_queue WHERE id=?", (jid,)).fetchone()[0],
+            "cancelled",
+        )
+
+    # ---- CP-RETRY (in-session) : reconcile cible du run empeche reselection ----
+    def test_cpretry_insession_reconcile_marks_published(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        # m1 clicked + id, PAS encore committe (failsafe-timeout in-session)
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "m1.mp4")
+        s.set_in_flight_post_id(rid, "b", 1, "m1.mp4", "POST_M1")
+        # PAS de crash/reopen : meme session, on reconcile le run courant
+        counts = s.reconcile_publish_in_flight(run_id_filter=rid)
+        self.assertEqual(counts["confirmed"], 1)
+        # m1 est publie -> ne sera pas reselectionne (exclu de pending)
+        self.assertIn("m1.mp4", s.get_active_batch().published_in_cycle)
+
+    # ---- WIRING : la sequence de boot REELLE du worker (Worker._boot_recover) ----
+    # Prouve le cablage WS7 de bout en bout (ordre des 4 appels, active_batch
+    # conserve car le job publish est requeue) SANS Docker ni navigateur.
+    def test_worker_boot_recover_wiring_end_to_end(self):
+        from fansly_bot.worker import Worker
+        s = self._fresh_store()
+        # etat residuel post-crash : job publish 'running' + orpheline confirmee
+        jid = self._enqueue_running_publish(s, "b")
+        rid = s.start_or_resume_batch("b", 0, jid)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        s.mark_publish_in_flight(rid, "b", 1, "m1.mp4", "cap")
+        s.mark_in_flight_clicked(rid, "b", 1, "m1.mp4")
+        s.set_in_flight_post_id(rid, "b", 1, "m1.mp4", "POST_M1")
+        s.close()
+        # boot du worker REEL (ouvre son propre StateStore sur la meme DB)
+        w = Worker(self.settings)
+        w._boot_recover()
+        st = w._state
+        # 1) orpheline confirmee (pas republiee) : ligne media_published, in_flight vide
+        self.assertEqual(st.list_orphan_in_flight(), [])
+        n = st._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='m1.mp4' "
+            "AND fansly_post_id='POST_M1'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+        # 2) job publish requeue (repris), pas 'failed'
+        self.assertEqual(
+            st._conn.execute("SELECT status FROM job_queue WHERE id=?", (jid,)).fetchone()[0],
+            "queued",
+        )
+        # 3) active_batch CONSERVE (car un job publish est queued) et resumable
+        ab = st.get_active_batch()
+        self.assertIsNotNone(ab)
+        self.assertEqual(ab.name, "b")
+        self.assertEqual(ab.run_id, rid)
+        self.assertIn("m1.mp4", ab.published_in_cycle)
+        st.close()
+
+    # ---- run_id stable : idempotence media_published a travers re-queues ----
+    def test_run_id_stable_prevents_duplicate_media_published(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.commit_publication(
+            run_id=rid, batch_name="b", cycle_number=1, media_filename="m1.mp4",
+            caption="c", fansly_post_id="P1", add_to_current_cycle=True,
+        )
+        # meme run_id (resume) => ON CONFLICT DO NOTHING, pas de doublon
+        s.commit_publication(
+            run_id=rid, batch_name="b", cycle_number=1, media_filename="m1.mp4",
+            caption="c", fansly_post_id="P1", add_to_current_cycle=True,
+        )
+        n = s._conn.execute(
+            "SELECT COUNT(*) FROM media_published WHERE media_filename='m1.mp4'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+
+# ============================================================
+# Exclusion des zombies id-NULL (#3) — fermeture du trou anti-doublon
+# ============================================================
+
+
+class TestZombieExclusion(_TmpStateMixin, unittest.TestCase):
+    """Un media publie SANS id capture (zombie clicked=1-sans-id) ne doit
+    JAMAIS etre republie : le post precedent (peut-etre cree) n'est pas rotable
+    (id inconnu), donc le republier creerait un doublon permanent. Ces tests
+    prouvent l'exclusion au niveau logique (aucun navigateur/disque)."""
+
+    def _fresh_store(self):
+        from fansly_bot.infra.state import StateStore
+        self.store = StateStore(self.settings)
+        return self.store
+
+    def _uploader(self, run_id):
+        """UploaderService REEL (via __new__) avec juste ce qu'il faut pour
+        exercer le vrai cablage list_pending_media -> _blocked_media ->
+        get_unconfirmed_media (aucun navigateur)."""
+        from fansly_bot.services.uploader import UploaderService
+        up = UploaderService.__new__(UploaderService)
+        up._settings = self.settings
+        up._state = self.store
+        up._run_id = run_id
+        return up
+
+    def _make_media(self, batch, names):
+        self.settings.paths.media_folder = self.tmp / "Medias"
+        folder = self.settings.paths.media_folder / batch
+        folder.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            (folder / n).write_bytes(b"x")
+
+    # ---- get_unconfirmed_media : ne remonte que les id-NULL du run ----
+    def test_get_unconfirmed_media_scopes_to_null_id_and_run(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        # confirme (id) -> PAS un zombie
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="ok.mp4", caption="c",
+                             fansly_post_id="P_OK", add_to_current_cycle=True)
+        # zombie (id NULL) du meme run
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="zombie.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=True)
+        # zombie d'un AUTRE run -> ne doit pas polluer
+        s.commit_publication(run_id=999, batch_name="b", cycle_number=1,
+                             media_filename="other_run.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=False)
+        unconfirmed = s.get_unconfirmed_media(rid)
+        self.assertEqual(unconfirmed, {"zombie.mp4"})
+
+    # ---- _select_next_media : saute le media bloque ----
+    def test_select_next_media_skips_blocked(self):
+        from fansly_bot.services.uploader import UploaderService
+        rng = __import__("random").Random(0)
+        playlist = ["z.mp4", "a.mp4", "b.mp4"]
+        # z.mp4 (1er de la playlist) est bloque -> doit prendre a.mp4
+        media, _, _ = UploaderService._select_next_media(
+            current_playlist=playlist, disk_names_sorted=sorted(playlist),
+            published_in_cycle=[], rng=rng, blocked={"z.mp4"},
+        )
+        self.assertEqual(media, "a.mp4")
+
+    def test_select_next_media_all_blocked_returns_none(self):
+        from fansly_bot.services.uploader import UploaderService
+        rng = __import__("random").Random(0)
+        pl = ["a.mp4", "b.mp4"]
+        media, _, event = UploaderService._select_next_media(
+            current_playlist=pl, disk_names_sorted=sorted(pl),
+            published_in_cycle=[], rng=rng, blocked={"a.mp4", "b.mp4"},
+        )
+        self.assertIsNone(media)
+        self.assertEqual(event, "exhausted")
+
+    # ---- LOGIQUE : _select_next_media + get_unconfirmed_media (fonction pure) ----
+    def test_zombie_excluded_from_selection_logic(self):
+        from fansly_bot.services.uploader import UploaderService
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m1.mp4", caption="c",
+                             fansly_post_id="P1", add_to_current_cycle=True)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m2.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=True)
+        s.advance_batch_cycle(2)
+        blocked = s.get_unconfirmed_media(rid)
+        self.assertIn("m2.mp4", blocked)
+        media, _, _ = UploaderService._select_next_media(
+            current_playlist=s.get_active_batch().playlist_order,
+            disk_names_sorted=["m1.mp4", "m2.mp4"],
+            published_in_cycle=s.get_active_batch().published_in_cycle,
+            rng=__import__("random").Random(0),
+            blocked=blocked,
+        )
+        self.assertEqual(media, "m1.mp4")
+
+    # ---- INTEGRATION REELLE : le vrai cablage exclut le zombie (pas de blocked passe a la main) ----
+    # Ce test ECHOUERAIT si on retirait le cablage blocked dans publish_next OU
+    # l'exclusion dans list_pending_media (couvre la "fausse assurance" relevee en revue).
+    def test_list_pending_media_excludes_zombie_real_wiring(self):
+        s = self._fresh_store()
+        self._make_media("b", ["m1.mp4", "m2.mp4"])
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        # m1 confirme, m2 zombie (id NULL)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m1.mp4", caption="c",
+                             fansly_post_id="P1", add_to_current_cycle=True)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m2.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=True)
+        s.advance_batch_cycle(2)
+        up = self._uploader(rid)
+        # VRAI cablage : _blocked_media -> get_unconfirmed_media
+        self.assertEqual(up._blocked_media(), {"m2.mp4"})
+        pending_names = {p.name for p in up.list_pending_media()}
+        self.assertIn("m1.mp4", pending_names)     # confirme -> republiable
+        self.assertNotIn("m2.mp4", pending_names)   # zombie -> jamais republie
+
+    # ---- INTEGRATION : advance_cycle_if_needed avance quand seul un confirme reste ----
+    def test_advance_cycle_progresses_with_confirmed_media(self):
+        s = self._fresh_store()
+        self._make_media("b", ["m1.mp4", "m2.mp4"])
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        # m2 zombie ; m1 confirme ET publie ce cycle -> plus rien de pending
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m1.mp4", caption="c",
+                             fansly_post_id="P1", add_to_current_cycle=True)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m2.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=True)
+        up = self._uploader(rid)
+        # m1 pas encore fait au cycle courant ? Il l'est (published_in_cycle).
+        # Donc pending vide -> mais PAS tous bloques (m1 confirme) -> avance.
+        self.assertEqual(up.advance_cycle_if_needed(), "advanced")
+        self.assertIsNotNone(s.get_active_batch())
+
+    # ---- INTEGRATION : anti-spin, tous bloques -> lot STOPPE (pas de boucle infinie) ----
+    def test_advance_cycle_stops_when_all_media_blocked(self):
+        s = self._fresh_store()
+        self._make_media("b", ["m1.mp4", "m2.mp4"])
+        rid = s.start_or_resume_batch("b", 0, 100)  # max_cycles=0 (infini)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        # LES DEUX medias sont des zombies -> aucun publiable -> boucle a vide
+        for m in ("m1.mp4", "m2.mp4"):
+            s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                                 media_filename=m, caption="c",
+                                 fansly_post_id=None, add_to_current_cycle=True)
+        s.advance_batch_cycle(2)
+        up = self._uploader(rid)
+        self.assertEqual(up.advance_cycle_if_needed(), "stopped")
+        self.assertIsNone(s.get_active_batch(), "lot doit etre stoppe, pas spinner")
+
+    # ---- CANCEL->RESTART : un media publie par un run ANTERIEUR (meme cycle) n'est pas republie ----
+    # Reproduit le bug prod perla_269 (5 medias run-26 absents du published_in_cycle
+    # du run-27). Ce test ECHOUERAIT sans la source cross-run get_published_media_in_cycle.
+    def test_cross_run_published_excluded_after_cancel_restart(self):
+        s = self._fresh_store()
+        self._make_media("b", ["m1.mp4", "m2.mp4", "m3.mp4"])
+        # Run A : publie m1 en cycle 1 (id reel) puis le lot est annule/arrete
+        ridA = s.start_or_resume_batch("b", 0, 26)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4", "m3.mp4"])
+        s.commit_publication(run_id=ridA, batch_name="b", cycle_number=1,
+                             media_filename="m1.mp4", caption="c",
+                             fansly_post_id="PA1", add_to_current_cycle=True)
+        s.stop_batch()
+        # Run B : RESTART FRAIS (nouveau run_id, published_in_cycle remis a zero)
+        ridB = s.start_or_resume_batch("b", 0, 27)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4", "m3.mp4"])
+        self.assertEqual(s.get_active_batch().published_in_cycle, [])
+        self.assertNotEqual(ridB, ridA)
+        up = self._uploader(ridB)
+        pending = {p.name for p in up.list_pending_media()}
+        # m1 (publie par run A dans CE cycle) ne doit PAS etre republie par run B
+        self.assertNotIn("m1.mp4", pending)
+        self.assertEqual(pending, {"m2.mp4", "m3.mp4"})
+
+    # ---- cross-run : le blocage est SCOPE au cycle courant (cycle N+1 republie) ----
+    def test_cross_run_exclusion_is_cycle_scoped(self):
+        s = self._fresh_store()
+        self._make_media("b", ["m1.mp4", "m2.mp4"])
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.set_batch_playlist_order(["m1.mp4", "m2.mp4"])
+        # m1 publie en cycle 1 (id reel)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="m1.mp4", caption="c",
+                             fansly_post_id="P1", add_to_current_cycle=True)
+        s.advance_batch_cycle(2)  # -> cycle 2
+        up = self._uploader(rid)
+        pending = {p.name for p in up.list_pending_media()}
+        # En cycle 2, m1 (publie en cycle 1) DOIT redevenir publiable (republication cyclique)
+        self.assertIn("m1.mp4", pending)
+        self.assertIn("m2.mp4", pending)
+
+    # ---- media confirme (id) reste republiable au cycle suivant ----
+    def test_confirmed_media_is_not_blocked(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="ok.mp4", caption="c",
+                             fansly_post_id="P_OK", add_to_current_cycle=True)
+        self.assertEqual(s.get_unconfirmed_media(rid), set())
+
+    # ---- CŒUR DU FIX : le scope run_id survit a un RESUME (run_id preserve) ----
+    def test_zombie_survives_resume_same_run_id(self):
+        s = self._fresh_store()
+        rid = s.start_or_resume_batch("b", 0, 100)
+        s.commit_publication(run_id=rid, batch_name="b", cycle_number=1,
+                             media_filename="z.mp4", caption="c",
+                             fansly_post_id=None, add_to_current_cycle=True)
+        # RESUME : meme nom de lot, job.id different -> doit renvoyer le run_id
+        # d'origine (rid), pas 777. Le zombie reste donc bloque.
+        rid2 = s.start_or_resume_batch("b", 0, 777)
+        self.assertEqual(rid2, rid, "resume doit preserver le run_id d'origine")
+        self.assertIn("z.mp4", s.get_unconfirmed_media(rid))
+
+    # ---- degradation gracieuse de _blocked_media ----
+    def test_blocked_media_none_run_id_returns_empty(self):
+        self._fresh_store()
+        up = self._uploader(None)
+        self.assertEqual(up._blocked_media(), set())
+
+    def test_blocked_media_swallows_lookup_error(self):
+        self._fresh_store()
+        up = self._uploader(42)
+
+        class _Boom:
+            def get_unconfirmed_media(self, *a, **k):
+                raise RuntimeError("db down")
+        up._state = _Boom()
+        # ne doit PAS propager -> set() (mais log warning, non asserte ici)
+        self.assertEqual(up._blocked_media(), set())
+
+
+# ============================================================
+# Garde anti-double-POST in-session (#2) — verrouillage de la decision
+# ============================================================
+
+
+class TestPostClickGuard(unittest.TestCase):
+    """Verrouille _should_emit_post_click : LE garde-fou du doublon historique.
+    Une inversion de cette logique = doublon reel sans crash -> ces tests
+    doivent echouer si quelqu'un casse la decision."""
+
+    def setUp(self):
+        from fansly_bot.services.uploader import UploaderService
+        self.decide = UploaderService._should_emit_post_click
+
+    def test_no_in_flight_row_clicks(self):
+        # Aucune ligne in_flight (1ere tentative) -> on clique
+        self.assertTrue(self.decide(None))
+
+    def test_clicked_zero_clicks(self):
+        # Write-ahead pose mais clic pas encore emis -> on clique
+        self.assertTrue(self.decide({"clicked": 0}))
+
+    def test_clicked_one_skips(self):
+        # Un clic Post a DEJA ete emis -> on NE reclique PAS (anti-doublon)
+        self.assertFalse(self.decide({"clicked": 1}))
+
+    def test_clicked_one_with_id_skips(self):
+        self.assertFalse(self.decide({"clicked": 1, "fansly_post_id": "P1"}))
+
+    def test_missing_clicked_key_defaults_to_click(self):
+        # Defensif : ligne sans champ 'clicked' -> on clique (write-ahead refera l'etat)
+        self.assertTrue(self.decide({}))
+
+    def test_clicked_zero_with_null_id_clicks(self):
+        self.assertTrue(self.decide({"clicked": 0, "fansly_post_id": None}))
 
 
 # =================== entry point ===================

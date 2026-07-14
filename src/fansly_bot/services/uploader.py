@@ -79,6 +79,15 @@ class UploaderService:
         # (lambda: self._state.is_cancellation_requested(job.id)). Default
         # = lambda: False si non fournie. Sert au cleaner ET au rotator.
         self._cancel_check: Callable[[], bool] = cancel_check or (lambda: False)
+        # Cle de la publication en cours (crash-resume) : {run_id, batch_name,
+        # cycle_number, media_filename}. Posee par publish_next avant l'upload,
+        # lue par _do_upload_inner (write-ahead + clicked) et le listener de
+        # capture (set_in_flight_post_id). None hors publication.
+        self._cur_inflight_key: Optional[dict] = None
+        # Compteur d'echecs consecutifs PRE-clic par media (fichier corrompu,
+        # selecteur casse). Apres N, on quarantaine le media pour que la
+        # playlist avance au lieu de boucler indefiniment sur le meme (WS5).
+        self._preclick_failures: dict[str, int] = {}
 
     # ---------- API publique ----------
 
@@ -105,26 +114,163 @@ class UploaderService:
         )
         return any_file
 
+    def _list_all_media_files(self, batch_name: str) -> list[Path]:
+        """Liste tous les fichiers medias valides du dossier du batch, tries.
+
+        Non-filtre : inclut publies ET pending. Utilise pour initialiser
+        ou etendre la playlist ordonnee.
+        """
+        batch_folder = self._settings.paths.media_folder / batch_name
+        if not batch_folder.is_dir():
+            log.warning("uploader_batch_folder_missing", batch=batch_name)
+            return []
+        exts = set(self._settings.publishing.media_extensions)
+        return sorted(
+            p for p in batch_folder.iterdir()
+            if p.is_file() and p.suffix.lower() in exts
+        )
+
+    @staticmethod
+    def _select_next_media(
+        current_playlist: list[str],
+        disk_names_sorted: list[str],
+        published_in_cycle: list[str],
+        rng: "random.Random",
+        blocked: "Optional[set[str]]" = None,
+    ) -> tuple[Optional[str], list[str], str]:
+        """Logique pure de selection du prochain media a publier.
+
+        Extrait comme methode statique pour etre testable en isolation
+        (aucune dependance a la BDD, au filesystem ou au network).
+
+        Parametres :
+          current_playlist   : la playlist actuellement stockee (peut etre [])
+          disk_names_sorted  : les noms de fichiers presents sur disque, tries
+          published_in_cycle : les fichiers deja publies dans le cycle courant
+          rng                : instance random.Random pour shuffle reproductible
+
+        Retour : (media_name, new_playlist, event_reason)
+          media_name    : le fichier a publier (None si playlist epuisee)
+          new_playlist  : la playlist mise a jour (a persister si != current)
+          event_reason  : "init" | "extend" | "unchanged" | "exhausted"
+
+        Regles :
+          - Si current_playlist vide : shuffle tous les noms disque -> nouvelle playlist
+          - Sinon : append en fin (ordre alphabetique stable) les noms
+            disque absents de la playlist (A1)
+          - Pick le premier nom de la playlist qui est absent de
+            published_in_cycle ET present sur disque (B1 : fichiers absents
+            sautes silencieusement).
+          - `blocked` : medias EXCLUS de la republication (zombies id-NULL du
+            run) — anti-doublon, jamais reselectionnes (cf.
+            StateStore.get_unconfirmed_media).
+        """
+        disk_set = set(disk_names_sorted)
+        published_set = set(published_in_cycle)
+        blocked_set = blocked or set()
+
+        # 1) Initialisation si vide
+        if not current_playlist:
+            new_playlist = list(disk_names_sorted)
+            rng.shuffle(new_playlist)
+            event = "init"
+        else:
+            new_playlist = list(current_playlist)
+            event = "unchanged"
+
+        # 2) A1 : appender nouveaux fichiers en ordre stable
+        playlist_set = set(new_playlist)
+        new_files = [n for n in disk_names_sorted if n not in playlist_set]
+        if new_files:
+            new_playlist = new_playlist + new_files
+            event = "extend" if event == "unchanged" else event
+
+        # 3) Pick : premier de la playlist qui est encore pending (pas publie) ET
+        #    encore present sur disque (B1 : sinon on skip) ET non bloque
+        #    (zombie id-NULL : anti-doublon, jamais republie).
+        for name in new_playlist:
+            if name in disk_set and name not in published_set and name not in blocked_set:
+                return name, new_playlist, event
+
+        # 4) Playlist epuisee : tout est publie OU tout a disparu du disque
+        return None, new_playlist, "exhausted"
+
+    @staticmethod
+    def _should_emit_post_click(existing_in_flight: "Optional[dict]") -> bool:
+        """Decision anti-double-POST DURABLE : faut-il emettre le clic Post ?
+
+        Extraite en fonction pure pour etre testee en isolation — c'est LE
+        garde-fou du doublon historique (une inversion ici = doublon reel sans
+        crash), donc il doit etre verrouille par des tests.
+
+        Entree : le resultat de StateStore.get_in_flight(**cle) pour le media
+        courant (None si aucune ligne).
+        Sortie :
+          - False si une ligne existe avec clicked=1 => un clic Post a DEJA ete
+            emis pour ce media (retry tenacity anterieur ou relance
+            failsafe-timeout in-session) => NE PAS recliquer (le post a pu etre
+            cree ; la reconciliation resoudra l'in_flight).
+          - True sinon (aucune ligne, ou clicked=0) => cliquer (avec write-ahead).
+        """
+        return not (existing_in_flight and existing_in_flight.get("clicked"))
+
+    def _published_this_cycle(self, batch) -> set[str]:
+        """Medias deja publies dans le CYCLE COURANT, tous runs confondus.
+
+        Union de :
+          - batch.published_in_cycle : run courant (inclut aussi les
+            quarantaines add_to_batch_published qui n'ecrivent PAS media_published) ;
+          - media_published pour (batch, cycle_courant) : couvre les
+            publications d'un run ANTERIEUR du meme lot (ex. apres un
+            cancel->restart : le nouveau run repart avec published_in_cycle vide)
+            -> sans ca, ces medias seraient republies = doublon in-cycle non
+            rotable.
+        """
+        published = set(batch.published_in_cycle)
+        try:
+            published |= self._state.get_published_media_in_cycle(
+                batch.name, batch.current_cycle
+            )
+        except Exception as e:  # noqa: BLE001 — ne jamais bloquer la publication
+            log.warning("published_in_cycle_lookup_failed", batch=batch.name, error=str(e))
+        return published
+
+    def _blocked_media(self) -> set[str]:
+        """Medias exclus de la (re)publication : zombies id-NULL du run courant.
+
+        Anti-doublon (cf. StateStore.get_unconfirmed_media) : un media dont un
+        cycle precedent a ete marque publie SANS id capture ne doit JAMAIS etre
+        republie — le post precedent (peut-etre cree) n'est pas rotable, donc le
+        republier creerait un doublon permanent. On le fige jusqu'a resolution
+        manuelle (WS8)."""
+        if self._run_id is None:
+            return set()
+        try:
+            return self._state.get_unconfirmed_media(self._run_id)
+        except Exception as e:  # noqa: BLE001 — jamais bloquer la publication sur cette lecture
+            # Mais NE PAS masquer une panne durable : sans ce log, un echec
+            # persistant de la lecture reactiverait silencieusement la
+            # republication des zombies (= reouverture du trou #3).
+            log.warning("blocked_media_lookup_failed", run_id=self._run_id, error=str(e))
+            return set()
+
     def list_pending_media(self) -> list[Path]:
         """Liste les medias du LOT ACTIF non encore publies dans le cycle courant.
 
         S'il n'y a pas de lot actif, renvoie une liste vide (mode rotation
-        uniquement, plus de mode one-shot a la racine).
+        uniquement, plus de mode one-shot a la racine). Exclut aussi les zombies
+        id-NULL du run (anti-doublon, cf. _blocked_media).
         """
         batch = self._state.get_active_batch()
         if batch is None:
             return []
-        batch_folder = self._settings.paths.media_folder / batch.name
-        if not batch_folder.is_dir():
-            log.warning("uploader_batch_folder_missing", batch=batch.name)
-            return []
-        exts = set(self._settings.publishing.media_extensions)
-        all_files = sorted(
-            p for p in batch_folder.iterdir()
-            if p.is_file() and p.suffix.lower() in exts
-        )
-        published = set(batch.published_in_cycle)
-        return [p for p in all_files if p.name not in published]
+        all_files = self._list_all_media_files(batch.name)
+        published = self._published_this_cycle(batch)  # cross-run (cancel->restart)
+        blocked = self._blocked_media()
+        return [
+            p for p in all_files
+            if p.name not in published and p.name not in blocked
+        ]
 
     def advance_cycle_if_needed(self) -> str:
         """Verifie si on doit avancer le cycle ou arreter le lot.
@@ -145,6 +291,25 @@ class UploaderService:
         pending = self.list_pending_media()
         if pending:
             return "continue"
+        # ANTI-SPIN (regression du fix #3) : si le cycle est "vide" UNIQUEMENT
+        # parce que TOUS les medias du lot sont bloques (zombies id-NULL, non
+        # republiables), avancer le cycle ne changera jamais rien -> boucle
+        # infinie a vide. On stoppe le lot avec une alerte, plutot que de
+        # tourner indefiniment. (Cas rare : exige que chaque media ait crashe
+        # dans la fenetre clic->capture.)
+        all_names = {p.name for p in self._list_all_media_files(batch.name)}
+        blocked = self._blocked_media()
+        if all_names and all_names <= blocked:
+            log.critical(
+                "uploader_batch_frozen_all_blocked",
+                batch=batch.name,
+                blocked=sorted(blocked),
+                hint="tous les medias du lot sont non confirmes (post peut-etre "
+                     "cree sans id capture) => lot STOPPE pour eviter une boucle "
+                     "a vide ; verifier le compte et resoudre (WS8)",
+            )
+            self._state.stop_batch()
+            return "stopped"
         # cycle complet
         next_cycle = batch.current_cycle + 1
         if 0 < batch.max_cycles < next_cycle:
@@ -184,6 +349,15 @@ class UploaderService:
         log.info("publish_next_acquiring_lock")
         async with self._session.use():
             log.info("publish_next_lock_acquired")
+            # WS3 — reconciliation des publications en cours orphelines de CE
+            # run AVANT toute selection. Couvre le chemin failsafe-timeout
+            # (worker.py relance publish_next dans le meme process sans avoir
+            # nettoye un in_flight de la tentative precedente) : l'orpheline est
+            # resolue (marquee publiee si un clic a eu lieu), donc le media
+            # n'est pas reselectionne et un second POST est evite. C'est le fix
+            # du doublon reproductible SANS redemarrage (CP-RETRY).
+            if self._run_id is not None:
+                self._state.reconcile_publish_in_flight(run_id_filter=self._run_id)
             batch = self._state.get_active_batch()
             if batch is None:
                 log.info("uploader_no_active_batch")
@@ -194,8 +368,69 @@ class UploaderService:
                 log.info("uploader_no_pending_in_cycle", batch=batch.name)
                 return None
 
-            # Tirage aleatoire dans le cycle courant
-            media = random.choice(pending)
+            # ---- Playlist ordonnee (fige au 1er cycle, conservee ensuite) ----
+            # Comportement voulu :
+            #   Cycle 1 : tirage aleatoire des medias du batch -> ordre fige
+            #             (persiste en DB dans active_batch.playlist_order)
+            #   Cycles 2+ : on suit CET ordre a l'identique, en sautant les
+            #               medias deja publies dans le cycle courant.
+            #   A1 : un nouveau fichier depose apres le 1er tirage est ajoute
+            #        a la fin de la playlist (sans re-shuffle).
+            #   B1 : un fichier disparu du disque est saute (l'ordre des
+            #        autres n'est pas modifie).
+            disk_files_sorted = self._list_all_media_files(batch.name)
+            disk_names = [p.name for p in disk_files_sorted]
+
+            # Zombies id-NULL du run : exclus de la selection (anti-doublon).
+            # Surface un WARNING tant que WS8 (UI) n'existe pas, pour que
+            # l'operateur sache qu'un media est fige et pourquoi.
+            blocked = self._blocked_media()
+            if blocked:
+                log.warning(
+                    "uploader_media_blocked_unconfirmed",
+                    batch=batch.name,
+                    blocked=sorted(blocked),
+                    hint="post peut-etre cree sans id capture => NON republie pour "
+                         "eviter un doublon non rotable ; verifier le compte (WS8)",
+                )
+
+            media_name, new_playlist, event = self._select_next_media(
+                current_playlist=batch.playlist_order,
+                disk_names_sorted=disk_names,
+                # cross-run (cancel->restart) : union published_in_cycle + media_published du cycle
+                published_in_cycle=list(self._published_this_cycle(batch)),
+                rng=random,
+                blocked=blocked,
+            )
+
+            # Persist si playlist modifiee (init ou extend)
+            if event == "init":
+                self._state.set_batch_playlist_order(new_playlist)
+                log.info(
+                    "uploader_playlist_initialized",
+                    batch=batch.name,
+                    size=len(new_playlist),
+                    order=new_playlist,
+                )
+            elif event == "extend":
+                self._state.set_batch_playlist_order(new_playlist)
+                added = [n for n in new_playlist if n not in batch.playlist_order]
+                log.info(
+                    "uploader_playlist_extended",
+                    batch=batch.name,
+                    added=added,
+                    new_size=len(new_playlist),
+                )
+
+            if media_name is None:
+                log.warning(
+                    "uploader_playlist_exhausted",
+                    batch=batch.name,
+                    playlist_size=len(new_playlist),
+                    published=len(batch.published_in_cycle),
+                )
+                return None
+            media = next(p for p in pending if p.name == media_name)
             caption = self._captions.pick(batch_name=self._captions_batch_name)
             log.info(
                 "uploader_starting",
@@ -217,6 +452,15 @@ class UploaderService:
             # _log_response, sans repasser par un attribut d'instance
             # (eliminerait le risque de corruption cross-upload).
             captured: dict = {"value": None}
+
+            # WS4 — cle de la publication en cours, lue par _do_upload_inner
+            # (write-ahead + clicked) et le listener de capture (persist id).
+            self._cur_inflight_key = {
+                "run_id": self._run_id,
+                "batch_name": batch.name,
+                "cycle_number": batch.current_cycle,
+                "media_filename": media.name,
+            }
 
             try:
                 await self._auth.ensure_logged_in()
@@ -259,9 +503,37 @@ class UploaderService:
                         await self._do_upload(media, caption, captured)
 
                 fp_id = captured.get("value")
-                self._mark_published(
-                    media, caption, batch.name, batch.current_cycle, fp_id,
-                )
+                # WS4 — commit ATOMIQUE : media_published + published_in_cycle +
+                # clear publish_in_flight en UNE transaction (ferme CP4). Remplace
+                # l'ancien _mark_published (2 ecritures non atomiques + pas de clear).
+                if self._run_id is not None:
+                    self._state.commit_publication(
+                        run_id=self._run_id,
+                        batch_name=batch.name,
+                        cycle_number=batch.current_cycle,
+                        media_filename=media.name,
+                        caption=caption,
+                        fansly_post_id=fp_id,
+                        add_to_current_cycle=True,
+                    )
+                    if fp_id:
+                        log.info(
+                            "uploader_mark_published_with_fansly_id",
+                            media=media.name, fansly_post_id=fp_id,
+                        )
+                    else:
+                        log.warning(
+                            "uploader_mark_published_without_fansly_id",
+                            media=media.name,
+                            reason="fansly_post_id_capture_failed_or_not_intercepted",
+                        )
+                else:
+                    # Fallback defensif si l'uploader tourne sans run_id (ne
+                    # devrait pas arriver : le worker passe toujours un run_id).
+                    self._mark_published(
+                        media, caption, batch.name, batch.current_cycle, fp_id,
+                    )
+                self._preclick_failures.pop(media.name, None)  # reset compteur WS5
                 log.info(
                     "uploader_published",
                     media=media.name,
@@ -274,7 +546,11 @@ class UploaderService:
             except Exception as e:  # noqa: BLE001
                 log.error("uploader_failed", media=media.name, error=str(e), exc_info=True)
                 await self._dump_artifact("upload_failed", media.name)
+                # WS5 — quarantaine anti-boucle-infinie sur echec PRE-clic.
+                self._maybe_quarantine_after_failure(batch, media)
                 return None
+            finally:
+                self._cur_inflight_key = None
 
     # ---------- coeur du flow Playwright ----------
 
@@ -571,7 +847,40 @@ class UploaderService:
 
         log.info("uploader_submit_button_active")
         await self._humanizer.short_pause()
-        await self._humanizer.hover_then_click(submit)
+
+        # WS4 — WRITE-AHEAD + garde anti-double-POST DURABLE (crash-resume).
+        # Juste avant le clic Post : on ecrit l'intent (publish_in_flight) PUIS
+        # clicked=1, commit AVANT le clic. A la reprise, l'etat clicked tranche :
+        #   clicked=0 => aucun POST parti => republier en surete
+        #   clicked=1 => un POST a pu partir => JAMAIS republier
+        # Garde in-session : si un clic a DEJA ete emis pour ce media (tentative
+        # tenacity anterieure ou relance failsafe-timeout), on NE reclique PAS.
+        # Cette garde repose sur l'etat DURABLE (clicked), PAS sur captured[value]
+        # en memoire (qui echoue justement en cas de capture ratee -> hole 4).
+        key = self._cur_inflight_key
+        if key and key.get("run_id") is not None:
+            existing = self._state.get_in_flight(**key)
+            if not self._should_emit_post_click(existing):
+                log.warning(
+                    "uploader_skip_reclick_already_clicked",
+                    media=media.name,
+                    hint="un clic Post a deja ete emis pour ce media -> pas de second POST",
+                )
+                # On ne reclique pas : le post a pu etre cree. La suite (attente
+                # fermeture composer / capture) se deroule ; a defaut la
+                # reconciliation du prochain publish_next resoudra l'in_flight.
+            else:
+                self._state.mark_publish_in_flight(
+                    key["run_id"], key["batch_name"], key["cycle_number"],
+                    key["media_filename"], caption,
+                )
+                self._state.mark_in_flight_clicked(
+                    key["run_id"], key["batch_name"], key["cycle_number"],
+                    key["media_filename"],
+                )
+                await self._humanizer.hover_then_click(submit)
+        else:
+            await self._humanizer.hover_then_click(submit)
 
         # 6) Verification que la publication a abouti : URL change ou composer ferme
         try:
@@ -731,6 +1040,45 @@ class UploaderService:
 
     # ---------- post-traitement ----------
 
+    def _maybe_quarantine_after_failure(self, batch, media: Path) -> None:
+        """WS5 — anti-boucle-infinie sur echec PRE-clic.
+
+        Si un upload echoue AVANT le write-ahead (fichier corrompu, selecteur
+        casse, composer introuvable), aucune ligne publish_in_flight n'existe :
+        aucun POST n'est parti, mais _select_next_media renverra deterministe-
+        ment le MEME 1er-pending au prochain tour -> boucle 60s a l'infini, le
+        lot n'avance jamais. On compte les echecs consecutifs par media ; apres
+        N, on QUARANTAINE le media (ajout a published_in_cycle => saute pour ce
+        cycle) pour que la playlist progresse, avec alerte CRITICAL.
+
+        Si une ligne in_flight EXISTE deja (le clic a pu partir), on ne
+        quarantaine PAS : la reconciliation du prochain publish_next resoudra
+        proprement (marque publie si clicked, sans republier).
+        """
+        if self._run_id is None:
+            return
+        try:
+            in_flight = self._state.get_in_flight(
+                self._run_id, batch.name, batch.current_cycle, media.name
+            )
+        except Exception:  # noqa: BLE001
+            in_flight = None
+        if in_flight is not None:
+            return  # write-ahead present -> la reconciliation gerera
+        n = self._preclick_failures.get(media.name, 0) + 1
+        self._preclick_failures[media.name] = n
+        if n >= 3:
+            self._state.add_to_batch_published(media.name)  # skip ce cycle
+            self._preclick_failures.pop(media.name, None)
+            log.critical(
+                "uploader_media_quarantined",
+                media=media.name, failures=n,
+                hint="echec pre-clic repete (fichier/selecteur ?) -> media saute "
+                     "pour que le lot avance ; a verifier manuellement",
+            )
+        else:
+            log.warning("uploader_preclick_failure", media=media.name, count=n)
+
     def _mark_published(
         self, media: Path, caption: str, batch_name: str, cycle: int,
         fansly_post_id: Optional[str],
@@ -842,6 +1190,22 @@ class UploaderService:
             captured["value"] = str(fp_id)
             self._capture_miss_streak = 0
             log.debug("uploader_captured_fansly_post_id", fansly_post_id=str(fp_id))
+            # WS4 — rendre l'id DURABLE immediatement (premier-gagne cote DB).
+            # Un 2xx sur POST /api/v1/post PROUVE que le post existe : on persiste
+            # l'id dans publish_in_flight sans attendre commit_publication. Ainsi
+            # un crash dans la fenetre "post cree / pas encore committe" (CP3,
+            # celle qui a produit le doublon reel) laisse un in_flight AVEC id
+            # que la reconciliation convertit en 'publie confirme', jamais en
+            # 're-publier'. Best-effort : une erreur ici n'interrompt pas la capture.
+            key = getattr(self, "_cur_inflight_key", None)
+            if key and key.get("run_id") is not None:
+                try:
+                    self._state.set_in_flight_post_id(
+                        key["run_id"], key["batch_name"], key["cycle_number"],
+                        key["media_filename"], str(fp_id),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.debug("set_in_flight_post_id_failed", error=str(e))
         else:
             # PII redact : on ne logue PAS le body brut (peut contenir
             # accountId du createur, caption, mediaIds, tokens internes).

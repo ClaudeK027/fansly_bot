@@ -169,18 +169,30 @@ class Worker:
         self._jobs_dir = settings.paths.logs_dir / "jobs"
         self._jobs_dir.mkdir(parents=True, exist_ok=True)
 
-    async def run_forever(self) -> int:
-        write_pid(self._settings)
-        write_worker_state(self._settings, "running")
-        log.info("worker_started", pid=os.getpid())
-        # Nettoie les jobs laisses 'running' par un crash precedent du worker
-        recovered = self._state.recover_stale_jobs()
-        if recovered:
-            log.warning("worker_recovered_stale_jobs", count=recovered)
-        # Nettoie un active_batch residuel (kill brutal du worker precedent
-        # alors qu'un cycle de publication etait en cours). Sans ca, l UI
-        # affiche en permanence le bandeau "lot actif" alors qu'aucun job
-        # ne le pilote — confusion utilisateur.
+    def _boot_recover(self) -> None:
+        # ─── MACHINE A ETATS DE REPRISE AU BOOT (crash-resume) ───
+        # Remplace l'ancien "recover_stale_jobs + cleanup_orphan" (qui JETAIT
+        # l'etat) par une vraie reprise. Ordre STRICT (DB-only, aucun
+        # navigateur — testable sans Docker) :
+        #
+        # 1) reconcile_publish_in_flight() : convertit chaque publication en
+        #    cours orpheline en 'publie' (jamais en 're-publier'). Ferme la
+        #    fenetre du doublon reel (post cree mais pas committe). Chaque
+        #    orpheline en transaction isolee (un orphelin pourri ne bloque pas
+        #    le boot).
+        self._state.reconcile_publish_in_flight()
+        # 2) reconcile_stale_jobs() : publish 'running' -> REQUEUE (repris,
+        #    position intacte) ; publish 'cancelling' -> cancelled ; purge ->
+        #    failed. Remplace le blanket running->failed.
+        self._state.reconcile_stale_jobs()
+        # 3) sweep_stale_cancelling() : tout 'cancelling' orphelin -> cancelled
+        #    (ferme la fenetre TOCTOU d'un cancel UI concurrent au boot).
+        self._state.sweep_stale_cancelling()
+        # 4) cleanup_orphan_active_batch() : supprime active_batch UNIQUEMENT
+        #    s'il n'a aucun job publish queued/running. Comme l'etape 2 a
+        #    requeue le job publish interrompu (=> queued), l'active_batch A
+        #    REPRENDRE est CONSERVE ; seul un batch reellement orphelin (aucun
+        #    driver) est nettoye.
         orphan_batch = self._state.cleanup_orphan_active_batch()
         if orphan_batch:
             log.warning(
@@ -188,6 +200,12 @@ class Worker:
                 batch=orphan_batch,
                 rationale="aucun_job_publish_actif_au_demarrage",
             )
+
+    async def run_forever(self) -> int:
+        write_pid(self._settings)
+        write_worker_state(self._settings, "running")
+        log.info("worker_started", pid=os.getpid())
+        self._boot_recover()
         try:
             while not self._stop_event.is_set():
                 try:
@@ -293,9 +311,20 @@ class Worker:
             raise RuntimeError(f"Job {job.id} : batch_name invalide ({e})") from e
         max_cycles = int(cfg.get("max_cycles", 0))
 
-        # Active le lot via la table active_batch (utilise par Uploader)
-        self._state.start_batch(batch_name, max_cycles=max_cycles)
-        log.info("publish_batch_activated", batch=batch_name, max_cycles=max_cycles)
+        # Active OU REPREND le lot (crash-resume). Si un active_batch de meme
+        # nom existe deja (job requeue apres crash), on RESUME sans reset :
+        # current_cycle, published_in_cycle, playlist_order et le run_id STABLE
+        # sont preserves -> la publication reprend exactement ou elle s'etait
+        # arretee. Sinon demarrage frais avec job.id comme run_id d'ancrage.
+        # Le run_id retourne (stable) est passe a l'uploader ET (via lui) au
+        # rotator, garantissant l'idempotence de media_published/publish_in_flight
+        # a travers les re-queues.
+        run_id = self._state.start_or_resume_batch(batch_name, max_cycles, job.id)
+        log.info(
+            "publish_batch_activated",
+            batch=batch_name, max_cycles=max_cycles,
+            run_id=run_id, resumed=(run_id != job.id),
+        )
 
         # Settings avec override des intervalles de publication
         custom_settings = self._settings.model_copy(deep=True)
@@ -334,7 +363,7 @@ class Worker:
         uploader = UploaderService(
             custom_settings, session, humanizer, auth, captions, self._state, retries,
             captions_batch_name=captions_batch_name,
-            run_id=job.id,
+            run_id=run_id,  # run_id STABLE du lot (pas job.id volatil) -> idempotence
             cycle_rotator=rotator,
             cancel_check=lambda: self._state.is_cancellation_requested(job.id),
         )
@@ -469,7 +498,26 @@ class Worker:
                 purger._date_window = (start, end)  # noqa: SLF001
                 log.info("purge_date_window_set", start=start.isoformat(), end=end.isoformat())
 
-            await purger.run()
+            # Mode "IDs stockes" : pour purger des posts PUBLIES PAR LE BOT sur
+            # une fenetre de dates, on supprime par permalien (fiable) au lieu
+            # de scroller le feed profil (fragile pour la suppression : le DOM
+            # se reorganise apres chaque delete, les items suivants deviennent
+            # introuvables). Necessite une fenetre de dates (start/end).
+            use_stored = bool(cfg.get("use_stored_ids", False))
+            if use_stored and start_iso and end_iso:
+                targets = self._state.get_published_post_ids_in_window(start_iso, end_iso)
+                log.info(
+                    "purge_stored_targets",
+                    count=len(targets),
+                    window=f"{start_iso}..{end_iso}",
+                )
+                await purger.purge_stored_ids(
+                    targets,
+                    dry_run=bool(cfg.get("dry_run", True)),
+                    max_deletions=int(cfg.get("max_deletions", 1000)),
+                )
+            else:
+                await purger.run()
         finally:
             with suppress(Exception):
                 await session.stop()

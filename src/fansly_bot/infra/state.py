@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS publish_in_flight (
     media_filename   TEXT NOT NULL,
     caption_used     TEXT,
     started_at       TEXT NOT NULL,
+    -- clicked : 0 = write-ahead ecrit mais le clic Post PAS ENCORE emis ;
+    --           1 = le clic Post a ete emis (donc un post a PU etre cree).
+    -- A la reprise : clicked=0 => aucun POST parti => republier en surete ;
+    --               clicked=1 => post peut exister => JAMAIS republier.
+    clicked          INTEGER NOT NULL DEFAULT 0,
+    -- fansly_post_id : rempli DES la reponse 2xx de POST /api/v1/post (dans le
+    -- listener, premier-gagne). Sa presence PROUVE que le post existe.
+    fansly_post_id   TEXT,
     PRIMARY KEY (run_id, batch_name, cycle_number, media_filename)
 );
 
@@ -93,7 +101,15 @@ CREATE TABLE IF NOT EXISTS active_batch (
     max_cycles         INTEGER NOT NULL DEFAULT 0,
     current_cycle      INTEGER NOT NULL DEFAULT 1,
     published_in_cycle TEXT NOT NULL DEFAULT '[]',  -- JSON list de filenames
-    total_published    INTEGER NOT NULL DEFAULT 0
+    total_published    INTEGER NOT NULL DEFAULT 0,
+    playlist_order     TEXT NOT NULL DEFAULT '[]',  -- JSON list : ordre fige tire au 1er cycle,
+                                                    -- conserve entre cycles (A1 : nouveaux fichiers
+                                                    -- ajoutes a la fin ; B1 : fichiers manquants sautes).
+    -- run_id : ancre STABLE du lot pour toute sa vie (survit aux re-queues et
+    -- redemarrages). media_published.run_id et publish_in_flight.run_id valent
+    -- ce run_id (et NON job.id, volatil). Ecrit par start_or_resume_batch ;
+    -- jamais NULL en pratique (migration backfille les lots pre-existants).
+    run_id             INTEGER
 );
 
 -- File d'attente de jobs (publication, purge).
@@ -149,6 +165,10 @@ class ActiveBatch:
     current_cycle: int
     published_in_cycle: list[str]   # noms de fichiers deja publies dans le cycle courant
     total_published: int
+    playlist_order: list[str]       # Ordre fige tire au 1er cycle. Se conserve entre cycles.
+                                    # Vide tant que le 1er tirage n'a pas eu lieu.
+    run_id: Optional[int] = None    # Ancre stable du lot (=id du job qui l'a demarre).
+                                    # Utilise pour media_published.run_id + publish_in_flight.
 
 
 @dataclass
@@ -231,6 +251,79 @@ class StateStore:
         # idempotent — la nouvelle media_published est creee si elle n'existait
         # pas ou vient d'etre renommee).
         self._conn.executescript(_SCHEMA)
+
+        # Etape 3 : migrations legeres pour DBs pre-existantes.
+        # active_batch.playlist_order : ajoute si absent. Sans cette clause,
+        # CREATE TABLE IF NOT EXISTS ne rajoute PAS la colonne aux tables deja
+        # creees dans une version anterieure.
+        cur = self._conn.execute("PRAGMA table_info(active_batch)")
+        active_batch_cols = {row["name"] for row in cur.fetchall()}
+        if active_batch_cols and "playlist_order" not in active_batch_cols:
+            log.info("state_schema_migration", table="active_batch", add_column="playlist_order")
+            self._conn.execute(
+                "ALTER TABLE active_batch ADD COLUMN playlist_order TEXT NOT NULL DEFAULT '[]'"
+            )
+
+        # publish_in_flight : colonnes clicked + fansly_post_id (crash-resume).
+        cur = self._conn.execute("PRAGMA table_info(publish_in_flight)")
+        pif_cols = {row["name"] for row in cur.fetchall()}
+        if pif_cols and "clicked" not in pif_cols:
+            log.info("state_schema_migration", table="publish_in_flight", add_column="clicked")
+            self._conn.execute(
+                "ALTER TABLE publish_in_flight ADD COLUMN clicked INTEGER NOT NULL DEFAULT 0"
+            )
+        if pif_cols and "fansly_post_id" not in pif_cols:
+            log.info("state_schema_migration", table="publish_in_flight", add_column="fansly_post_id")
+            self._conn.execute(
+                "ALTER TABLE publish_in_flight ADD COLUMN fansly_post_id TEXT"
+            )
+
+        # active_batch.run_id : ancre stable du lot. MIGRATION VERROUILLEE —
+        # un run_id NULL casserait a la fois l'idempotence UNIQUE de
+        # media_published (NULL != NULL en SQLite => ON CONFLICT ne se declenche
+        # jamais) ET la rotation (ValueError sur run_id None). Donc :
+        #   - si un active_batch pre-existe sans run_id : on le backfille depuis
+        #     l'id du dernier job publish connu, et on REECRIT media_published.
+        #     run_id de ce batch pour rester coherent ;
+        #   - si aucun job publish trouvable : on supprime l'active_batch (stop
+        #     propre) plutot que de laisser un run_id indefini remonter.
+        if active_batch_cols and "run_id" not in active_batch_cols:
+            log.info("state_schema_migration", table="active_batch", add_column="run_id")
+            self._conn.execute("ALTER TABLE active_batch ADD COLUMN run_id INTEGER")
+            row = self._conn.execute(
+                "SELECT name FROM active_batch WHERE id = 1"
+            ).fetchone()
+            if row is not None:
+                batch_name = row["name"]
+                job = self._conn.execute(
+                    "SELECT id FROM job_queue WHERE type = 'publish' "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if job is not None:
+                    backfill_run_id = job["id"]
+                    self._conn.execute(
+                        "UPDATE active_batch SET run_id = ? WHERE id = 1",
+                        (backfill_run_id,),
+                    )
+                    # Coherence : toutes les lignes media_published de ce batch
+                    # doivent porter le meme run_id (sinon UNIQUE/rotation KO).
+                    self._conn.execute(
+                        "UPDATE media_published SET run_id = ? WHERE batch_name = ?",
+                        (backfill_run_id, batch_name),
+                    )
+                    log.warning(
+                        "active_batch_run_id_backfilled",
+                        batch=batch_name, run_id=backfill_run_id,
+                    )
+                else:
+                    # Aucun job publish : active_batch orphelin, stop propre.
+                    self._conn.execute("DELETE FROM active_batch WHERE id = 1")
+                    log.warning(
+                        "active_batch_dropped_no_run_id",
+                        batch=batch_name,
+                        rationale="migration_run_id_sans_job_publish",
+                    )
+
         self._conn.commit()
 
     def close(self) -> None:
@@ -396,6 +489,103 @@ class StateStore:
         row = cur.fetchone()
         return row[0] if row else None
 
+    def get_unconfirmed_media(self, run_id: int) -> set[str]:
+        """Medias de CE run publies SANS fansly_post_id capture (zombies).
+
+        Un 'zombie' nait quand un crash survient dans la fenetre clic Post ->
+        capture de l'id : reconcile marque le media publie avec
+        fansly_post_id=NULL (branche clicked=1 sans id). Le post EXISTE peut-etre
+        sur Fansly mais son id est inconnu, donc :
+          - il n'est PAS rotable (get_fansly_post_id_for_previous_cycle exige
+            fansly_post_id IS NOT NULL) ;
+          - le republier au cycle suivant creerait un DOUBLON permanent que la
+            rotation ne pourra jamais nettoyer.
+
+        GARANTIE ANTI-DOUBLON : la selection de media (uploader) EXCLUT ces
+        fichiers des cycles suivants -> on ne republie jamais un media dont on
+        n'a pas pu confirmer/roter le post precedent. Scope run_id (stable a
+        travers les re-queues) : n'affecte que le run courant, pas un autre lot.
+
+        Cette liste est aussi la source de donnees de la future file de
+        verification manuelle (WS8) : chaque entree = 'un post a peut-etre ete
+        cree mais non confirme, a verifier sur le compte'.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT DISTINCT media_filename FROM media_published
+            WHERE run_id = ? AND fansly_post_id IS NULL
+            """,
+            (run_id,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+    def get_published_media_in_cycle(self, batch_name: str, cycle_number: int) -> set[str]:
+        """Medias deja publies dans (batch, cycle) — TOUS runs confondus.
+
+        Source durable = media_published (persistant), independante de
+        active_batch.published_in_cycle qui, lui, est PAR RUN et remis a zero au
+        demarrage d'un nouveau run.
+
+        ANTI-DOUBLON cancel->restart : quand un job publish est annule puis
+        relance, le nouveau run repart avec published_in_cycle vide alors que le
+        run precedent a deja publie des medias DANS CE CYCLE. Sans cette source
+        cross-run, ces medias seraient re-selectionnes et republies (doublon
+        in-cycle non rotable, car la rotation ne cible que les cycles ANTERIEURS).
+        La selection exclut donc l'union (published_in_cycle | ce set).
+
+        Scope cycle_number STRICT : en cycle N+1, les publications du cycle N
+        ne bloquent pas (republication cyclique voulue, avec rotation).
+        """
+        cur = self._conn.execute(
+            """
+            SELECT DISTINCT media_filename FROM media_published
+            WHERE batch_name = ? AND cycle_number = ?
+            """,
+            (batch_name, cycle_number),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+    def get_published_post_ids_in_window(
+        self, start_iso: str, end_iso: str
+    ) -> list[tuple[str, str, str]]:
+        """Renvoie les posts publies par le bot dans une fenetre de dates,
+        avec leur fansly_post_id STABLE (capture a la publication).
+
+        Utilise par la purge "par IDs stockes" : au lieu de scroller le feed
+        profil (fragile pour la suppression), on supprime directement chaque
+        post via son permalien fansly.com/post/<id> — methode fiable et
+        eprouvee (identique au CycleRotator).
+
+        Retour : liste de (fansly_post_id, media_filename, published_at),
+        triee par date de publication. Seuls les posts AVEC un fansly_post_id
+        non-null sont inclus (les rares captures ratees ne sont pas ciblables
+        par permalien). Deduplique par fansly_post_id (garde la 1ere occurrence).
+        """
+        # Comparaison sur DATE() (et non chaine ISO brute) : robuste aux
+        # differences de fuseau/precision dans published_at (avec ou sans
+        # +00:00, microsecondes variables). SQLite DATE() parse l'ISO8601 et
+        # renvoie 'YYYY-MM-DD'. Fenetre INCLUSIVE des deux jours bornes.
+        cur = self._conn.execute(
+            """
+            SELECT fansly_post_id, media_filename, published_at
+            FROM media_published
+            WHERE DATE(published_at) >= DATE(?)
+              AND DATE(published_at) <= DATE(?)
+              AND fansly_post_id IS NOT NULL
+              AND fansly_post_id != ''
+            ORDER BY published_at
+            """,
+            (start_iso, end_iso),
+        )
+        seen: set[str] = set()
+        out: list[tuple[str, str, str]] = []
+        for pid, media, pub_at in cur.fetchall():
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append((pid, media, pub_at))
+        return out
+
     # ----- publish_in_flight -----
 
     def mark_publish_in_flight(
@@ -461,15 +651,72 @@ class StateStore:
                 (run_id, batch_name, cycle_number, media_filename),
             )
 
+    def set_in_flight_post_id(
+        self,
+        run_id: int,
+        batch_name: str,
+        cycle_number: int,
+        media_filename: str,
+        fansly_post_id: str,
+    ) -> None:
+        """Persiste le fansly_post_id d'une publication en cours DES la reponse
+        2xx (premier-gagne : on n'ecrase pas un id deja pose). Rend durable la
+        preuve de creation le plus tot possible => reduit la fenetre de crash
+        'post existe mais aucune trace en base'."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE publish_in_flight SET fansly_post_id = ? "
+                "WHERE run_id = ? AND batch_name = ? AND cycle_number = ? "
+                "AND media_filename = ? AND fansly_post_id IS NULL",
+                (fansly_post_id, run_id, batch_name, cycle_number, media_filename),
+            )
+
+    def mark_in_flight_clicked(
+        self,
+        run_id: int,
+        batch_name: str,
+        cycle_number: int,
+        media_filename: str,
+    ) -> None:
+        """Marque qu'un clic Post a ete emis pour cette publication (clicked=1).
+        A appeler JUSTE avant hover_then_click(submit), commit avant le clic."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE publish_in_flight SET clicked = 1 "
+                "WHERE run_id = ? AND batch_name = ? AND cycle_number = ? "
+                "AND media_filename = ?",
+                (run_id, batch_name, cycle_number, media_filename),
+            )
+
+    def get_in_flight(
+        self,
+        run_id: int,
+        batch_name: str,
+        cycle_number: int,
+        media_filename: str,
+    ) -> Optional[dict]:
+        """Retourne la ligne publish_in_flight (dict) ou None."""
+        cur = self._conn.execute(
+            "SELECT run_id, batch_name, cycle_number, media_filename, "
+            "caption_used, started_at, clicked, fansly_post_id "
+            "FROM publish_in_flight WHERE run_id = ? AND batch_name = ? "
+            "AND cycle_number = ? AND media_filename = ?",
+            (run_id, batch_name, cycle_number, media_filename),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def list_orphan_in_flight(self) -> list[dict]:
         """Liste les publications 'en cours' restees orphelines (crash worker).
 
-        Retourne une liste de dicts avec les 6 colonnes — le worker decidera
-        quoi faire (typiquement : marquer published puis nettoyer).
+        Retourne une liste de dicts avec clicked + fansly_post_id — la
+        reconciliation decidera : clicked=0 => republier ; clicked=1+id =>
+        publie confirme ; clicked=1 sans id => ambigu (skip + alerte).
         """
         cur = self._conn.execute(
             "SELECT run_id, batch_name, cycle_number, media_filename, "
-            "caption_used, started_at FROM publish_in_flight"
+            "caption_used, started_at, clicked, fansly_post_id "
+            "FROM publish_in_flight"
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -480,6 +727,15 @@ class StateStore:
         row = cur.fetchone()
         if not row:
             return None
+        # playlist_order / run_id optionnels (DB pre-migration) : fallback
+        try:
+            playlist_raw = row["playlist_order"]
+        except (IndexError, KeyError):
+            playlist_raw = "[]"
+        try:
+            run_id_val = row["run_id"]
+        except (IndexError, KeyError):
+            run_id_val = None
         return ActiveBatch(
             name=row["name"],
             started_at=datetime.fromisoformat(row["started_at"]),
@@ -487,19 +743,206 @@ class StateStore:
             current_cycle=row["current_cycle"],
             published_in_cycle=json.loads(row["published_in_cycle"]),
             total_published=row["total_published"],
+            playlist_order=json.loads(playlist_raw or "[]"),
+            run_id=run_id_val,
         )
 
     def start_batch(self, name: str, max_cycles: int = 0) -> None:
+        # Un nouveau batch demarre TOUJOURS avec une playlist vide : elle sera
+        # tiree aleatoirement au 1er appel de publish_next (cf uploader.py).
+        # Consequence attendue : chaque nouveau batch a un nouvel ordre aleatoire.
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO active_batch
                     (id, name, started_at, max_cycles, current_cycle,
-                     published_in_cycle, total_published)
-                VALUES (1, ?, ?, ?, 1, '[]', 0)
+                     published_in_cycle, total_published, playlist_order)
+                VALUES (1, ?, ?, ?, 1, '[]', 0, '[]')
                 """,
                 (name, now, max_cycles),
+            )
+
+    def start_or_resume_batch(
+        self, name: str, max_cycles: int, run_id: int
+    ) -> int:
+        """Demarre un lot OU le reprend s'il existe deja (crash-resume).
+
+        - active_batch de MEME nom deja present (avec run_id) => RESUME : on
+          preserve current_cycle, published_in_cycle, playlist_order,
+          total_published et le run_id EXISTANT (on ignore le run_id fourni).
+          Retourne le run_id existant. La position dans le cycle est intacte.
+        - sinon => DEMARRAGE FRAIS : INSERT OR REPLACE (cycle 1, listes vides)
+          avec le run_id fourni comme ancre stable. Retourne ce run_id.
+
+        Le worker distingue reprise vs (re)demarrage voulu par la SEULE presence
+        d'un active_batch de meme nom : pour repartir de zero, l'utilisateur
+        stoppe d'abord le lot (stop_batch supprime l'active_batch).
+        """
+        existing = self.get_active_batch()
+        if existing is not None and existing.name == name and existing.run_id is not None:
+            log.info(
+                "batch_resume",
+                batch=name, cycle=existing.current_cycle,
+                published=len(existing.published_in_cycle), run_id=existing.run_id,
+            )
+            return existing.run_id
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO active_batch
+                    (id, name, started_at, max_cycles, current_cycle,
+                     published_in_cycle, total_published, playlist_order, run_id)
+                VALUES (1, ?, ?, ?, 1, '[]', 0, '[]', ?)
+                """,
+                (name, now, max_cycles, run_id),
+            )
+        log.info("batch_start_fresh", batch=name, run_id=run_id)
+        return run_id
+
+    def commit_publication(
+        self,
+        *,
+        run_id: int,
+        batch_name: str,
+        cycle_number: int,
+        media_filename: str,
+        caption: Optional[str],
+        fansly_post_id: Optional[str],
+        add_to_current_cycle: bool,
+    ) -> None:
+        """Valide une publication de maniere ATOMIQUE : media_published +
+        published_in_cycle (si le media appartient au cycle courant) + clear de
+        publish_in_flight, le tout dans UNE seule transaction.
+
+        Les 3 ecritures sont INLINEES (pas d'appel aux helpers, dont les propres
+        `with self._conn:` casseraient l'atomicite par commit anticipe -> CP4).
+        Idempotent : ON CONFLICT DO NOTHING + garde 'not in published'.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO media_published
+                    (run_id, batch_name, cycle_number, media_filename,
+                     published_at, caption_used, fansly_post_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (run_id, batch_name, cycle_number, media_filename)
+                DO NOTHING
+                """,
+                (run_id, batch_name, cycle_number, media_filename, now, caption, fansly_post_id),
+            )
+            if add_to_current_cycle:
+                row = self._conn.execute(
+                    "SELECT published_in_cycle FROM active_batch WHERE id = 1"
+                ).fetchone()
+                if row is not None:
+                    published = json.loads(row["published_in_cycle"] or "[]")
+                    if media_filename not in published:
+                        published.append(media_filename)
+                        self._conn.execute(
+                            "UPDATE active_batch SET published_in_cycle = ?, "
+                            "total_published = total_published + 1 WHERE id = 1",
+                            (json.dumps(published),),
+                        )
+            self._conn.execute(
+                "DELETE FROM publish_in_flight WHERE run_id = ? AND batch_name = ? "
+                "AND cycle_number = ? AND media_filename = ?",
+                (run_id, batch_name, cycle_number, media_filename),
+            )
+
+    def reconcile_publish_in_flight(
+        self, run_id_filter: Optional[int] = None
+    ) -> dict:
+        """Reconcilie les publications 'en cours' orphelines. Appele au boot du
+        worker (run_id_filter=None : toutes) ET au top de publish_next
+        (run_id_filter=run_id courant : couvre le failsafe-timeout in-session).
+
+        Regle NON NEGOCIABLE (anti-doublon) : une orpheline ne mene JAMAIS a
+        'republier' sauf preuve durable qu'aucun POST n'est parti (clicked=0).
+          - clicked=0            => aucun clic => rien parti => clear (republiera)
+          - clicked=1 + id       => post confirme cree => commit_publication
+          - clicked=1 + id NULL  => AMBIGU => skip conservateur (marque publie) +
+                                     log CRITICAL (zombie potentiel non rotable)
+
+        Chaque orpheline est traitee independamment (try/except) : une orpheline
+        pourrie ou un active_batch absent ne doivent JAMAIS empecher le boot.
+        """
+        counts = {"republish": 0, "confirmed": 0, "ambiguous_zombie": 0, "errors": 0}
+        batch = self.get_active_batch()
+        for o in self.list_orphan_in_flight():
+            if run_id_filter is not None and o["run_id"] != run_id_filter:
+                continue
+            try:
+                same_cycle = (
+                    batch is not None
+                    and o["batch_name"] == batch.name
+                    and o["cycle_number"] == batch.current_cycle
+                )
+                if not o["clicked"]:
+                    self.clear_publish_in_flight(
+                        o["run_id"], o["batch_name"], o["cycle_number"], o["media_filename"]
+                    )
+                    counts["republish"] += 1
+                    log.info(
+                        "reconcile_orphan_republish",
+                        media=o["media_filename"], run_id=o["run_id"],
+                        rationale="clicked=0 => aucun POST parti",
+                    )
+                elif o["fansly_post_id"]:
+                    self.commit_publication(
+                        run_id=o["run_id"], batch_name=o["batch_name"],
+                        cycle_number=o["cycle_number"], media_filename=o["media_filename"],
+                        caption=o.get("caption_used"), fansly_post_id=o["fansly_post_id"],
+                        add_to_current_cycle=same_cycle,
+                    )
+                    counts["confirmed"] += 1
+                    log.info(
+                        "reconcile_orphan_confirmed",
+                        media=o["media_filename"], fansly_post_id=o["fansly_post_id"],
+                    )
+                else:
+                    # clicked=1 sans id : le post EXISTE peut-etre. On ne republie
+                    # PAS (doublon interdit). On marque publie + alerte CRITICAL.
+                    self.commit_publication(
+                        run_id=o["run_id"], batch_name=o["batch_name"],
+                        cycle_number=o["cycle_number"], media_filename=o["media_filename"],
+                        caption=o.get("caption_used"), fansly_post_id=None,
+                        add_to_current_cycle=same_cycle,
+                    )
+                    counts["ambiguous_zombie"] += 1
+                    log.critical(
+                        "reconcile_orphan_ambiguous_zombie",
+                        media=o["media_filename"], run_id=o["run_id"],
+                        hint="POST peut-etre parti sans id capture => post potentiellement "
+                             "cree mais NON rotable (id inconnu) => verifier le compte et "
+                             "supprimer manuellement si doublon",
+                    )
+            except Exception as e:  # noqa: BLE001 — une orpheline ne bloque pas le boot
+                counts["errors"] += 1
+                log.error(
+                    "reconcile_orphan_failed",
+                    media=o.get("media_filename"), error=str(e),
+                )
+        if any(counts.values()):
+            log.warning("reconcile_publish_in_flight_summary", **counts)
+        return counts
+
+    def set_batch_playlist_order(self, playlist: list[str]) -> None:
+        """Ecrit l'ordre de playlist du batch actif.
+
+        Utilise :
+          - au 1er cycle : shuffle initial des medias du dossier
+          - au fil de l'eau : append des nouveaux fichiers detectes (A1)
+
+        Ne DOIT PAS etre appelee entre les cycles pour "reset" — la playlist
+        est PAR CONSTRUCTION preservee entre cycles.
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE active_batch SET playlist_order = ? WHERE id = 1",
+                (json.dumps(playlist),),
             )
 
     def stop_batch(self) -> None:
@@ -507,13 +950,18 @@ class StateStore:
             self._conn.execute("DELETE FROM active_batch WHERE id = 1")
 
     def add_to_batch_published(self, filename: str) -> None:
-        """Ajoute un fichier a la liste des publies du cycle courant, incremente le total."""
+        """Ajoute un fichier aux publies du cycle courant + incremente le total.
+
+        IDEMPOTENT : si le fichier est deja dans published_in_cycle, no-op TOTAL
+        (y compris total_published, qui ne doit PAS etre double-compte lors
+        d'une reapplication de la reconciliation — cf. CP4)."""
         batch = self.get_active_batch()
         if not batch:
             return
         published = batch.published_in_cycle
-        if filename not in published:
-            published.append(filename)
+        if filename in published:
+            return  # deja compte : no-op strict (pas de double-comptage)
+        published.append(filename)
         with self._conn:
             self._conn.execute(
                 """
@@ -652,6 +1100,70 @@ class StateStore:
                 "error = COALESCE(error, '') || ' [recovered_from_crash]' "
                 "WHERE status IN ('running', 'cancelling')",
                 (now,),
+            )
+            return cur.rowcount
+
+    def requeue_job(self, job_id: int) -> bool:
+        """Remet un job 'running' en 'queued' pour qu'il soit REPRIS (au lieu
+        de le marquer failed). Garde WHERE status='running' : no-op si le job a
+        change d'etat entre-temps (ex: annulation concurrente). Retourne True si
+        effectivement re-queue."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE job_queue SET status = 'queued', started_at = NULL, "
+                "finished_at = NULL WHERE id = ? AND status = 'running'",
+                (job_id,),
+            )
+            return cur.rowcount > 0
+
+    def reconcile_stale_jobs(self) -> dict:
+        """Remplace recover_stale_jobs pour la reprise-apres-crash. Au boot :
+          - publish 'running'    => REQUEUE (le lot sera repris, position intacte)
+          - publish 'cancelling' => cancelled (l'utilisateur avait demande l'arret)
+          - purge   running/canc => failed [recovered_from_crash] (pas de resume fin)
+        Retourne un dict de comptage.
+        """
+        counts = {"publish_requeued": 0, "publish_cancelled": 0, "purge_failed": 0}
+        now = datetime.now(timezone.utc).isoformat()
+        rows = self._conn.execute(
+            "SELECT id, type, status FROM job_queue "
+            "WHERE status IN ('running', 'cancelling')"
+        ).fetchall()
+        for r in rows:
+            jid, jtype, jstatus = r["id"], r["type"], r["status"]
+            with self._conn:
+                if jtype == "publish" and jstatus == "running":
+                    self._conn.execute(
+                        "UPDATE job_queue SET status = 'queued', started_at = NULL, "
+                        "finished_at = NULL WHERE id = ?", (jid,),
+                    )
+                    counts["publish_requeued"] += 1
+                elif jtype == "publish" and jstatus == "cancelling":
+                    self._conn.execute(
+                        "UPDATE job_queue SET status = 'cancelled', finished_at = ? "
+                        "WHERE id = ?", (now, jid),
+                    )
+                    counts["publish_cancelled"] += 1
+                else:  # purge (ou tout autre) : pas de reprise fine
+                    self._conn.execute(
+                        "UPDATE job_queue SET status = 'failed', finished_at = ?, "
+                        "error = COALESCE(error, '') || ' [recovered_from_crash]' "
+                        "WHERE id = ?", (now, jid),
+                    )
+                    counts["purge_failed"] += 1
+        if any(counts.values()):
+            log.warning("reconcile_stale_jobs_summary", **counts)
+        return counts
+
+    def sweep_stale_cancelling(self) -> int:
+        """Convertit tout job encore 'cancelling' en 'cancelled' (aucun worker
+        ne le finira). Ferme la fenetre TOCTOU boot ou un cancel UI concurrent
+        laisse un job coince en 'cancelling'. Retourne le nombre nettoye."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE job_queue SET status = 'cancelled', finished_at = ? "
+                "WHERE status = 'cancelling'", (now,),
             )
             return cur.rowcount
 
