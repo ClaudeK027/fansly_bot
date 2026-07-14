@@ -19,9 +19,15 @@ WORKDIR /app
 # On copie d abord le manifeste pour qu un changement de code ne casse pas
 # le cache de pip install.
 COPY pyproject.toml ./
+# playwright PINNE == version de l'image de base (v1.60.0-noble). Les binaires
+# Chromium sont fournis PAR l'image de base ; si pip installe une version
+# playwright plus recente (ex 1.61.0), elle cherche une revision Chromium
+# absente de l'image -> "Executable doesn't exist" -> le bot ne peut plus
+# lancer de navigateur. Toute montee de version playwright DOIT etre accompagnee
+# d'un bump du tag de l'image FROM. Idem streamlit (assets JS caches navigateur).
 RUN pip install --upgrade pip && \
     pip install \
-        "playwright>=1.47.0" \
+        "playwright==1.60.0" \
         "playwright-stealth>=2.0.0" \
         "structlog>=24.1.0" \
         "pendulum>=3.0.0" \
@@ -30,7 +36,7 @@ RUN pip install --upgrade pip && \
         "pyyaml>=6.0.1" \
         "watchdog>=4.0.0" \
         "tenacity>=8.2.3" \
-        "streamlit>=1.30.0" \
+        "streamlit==1.58.0" \
         "ruamel.yaml>=0.18.0"
 
 # Code source (couche separee : un changement de code ne reinstalle pas les deps)

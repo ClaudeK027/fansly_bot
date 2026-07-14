@@ -123,12 +123,24 @@ def _container_to_instance(c: "Container") -> Optional[Instance]:
     else:
         return None
     started_at = c.attrs.get("State", {}).get("StartedAt") or None
+    # NE PAS utiliser c.image[.tags] : docker-py fait un lazy GET
+    # /images/<id>/json qui leve ImageNotFound (404) si l'image a ete
+    # supprimee/remplacee (typiquement apres un rebuild du tag qui orpheline
+    # l'ancienne image encore referencee par un container arrete). Ce 404
+    # remontait jusqu'au except global de safe_list_instances et faisait
+    # planter TOUTE la liste (un seul container pourri aveuglait le manager).
+    # On lit la reference d'image depuis c.attrs (deja charge par le listing,
+    # aucun round-trip, jamais 404) : Config.Image = le tag au moment de la
+    # creation (ex "fansly-bot:latest"), fallback sur l'ID court tronque.
+    img_id = c.attrs.get("Image", "") or ""
+    img_short = img_id.split(":")[-1][:12] if img_id else "?"
+    image_ref = (c.attrs.get("Config", {}) or {}).get("Image") or img_short
     return Instance(
         name=name,
         container=c.name,
         status=c.status,
         host_port=_extract_host_port(c.attrs),
-        image=(c.image.tags[0] if c.image.tags else c.image.short_id),
+        image=image_ref,
         started_at=started_at,
     )
 
@@ -182,7 +194,13 @@ def safe_list_instances() -> Result[list[Instance]]:
         client = _client()
         instances: list[Instance] = []
         for c in client.containers.list(all=True):
-            inst = _container_to_instance(c)
+            # Isolation par container : un container corrompu (image morte,
+            # attrs partiels, etc.) ne doit JAMAIS faire echouer toute la
+            # liste. On le skip et on continue — le manager reste utilisable.
+            try:
+                inst = _container_to_instance(c)
+            except Exception:  # noqa: BLE001 — resilience per-container
+                continue
             if inst is not None:
                 instances.append(inst)
         instances.sort(key=lambda i: i.name)

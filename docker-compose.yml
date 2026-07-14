@@ -33,9 +33,22 @@ services:
       - ${ENV_FILE:-.env}
 
     # Override de AUTOSTART_WORKER si besoin (defaut true via entrypoint).
-    # Decommente pour desactiver l autostart :
-    # environment:
-    #   AUTOSTART_WORKER: "false"
+    # Decommente pour desactiver l autostart : AUTOSTART_WORKER: "false"
+    #
+    # Tuning glibc malloc (mitigation memoire, cf diagnostic leak Streamlit) :
+    # - MALLOC_ARENA_MAX=2 : borne le nombre d arenes (defaut 8*nproc) pour
+    #   limiter l overhead multi-arenes en contexte multithread (Streamlit 18 th).
+    # - MALLOC_TRIM_THRESHOLD_=131072 : abaisse le seuil d auto-trim du top chunk
+    #   du main arena a 128KB pour que glibc rende la memoire a l OS plus tot.
+    # Mitigation PARTIELLE : n annule pas la fragmentation brk d un process 24/7,
+    # le vrai fix est la separation worker/dashboard en 2 containers (Phase 2).
+    environment:
+      MALLOC_ARENA_MAX: "2"
+      MALLOC_TRIM_THRESHOLD_: "131072"
+      # Autostart du worker au boot du container (defaut true). Passer
+      # AUTOSTART_WORKER=false pour piloter le worker manuellement (tests,
+      # maintenance) : le container ne lance alors que Streamlit.
+      AUTOSTART_WORKER: "${AUTOSTART_WORKER:-true}"
 
     # Bind mounts : tout l etat persistant vit dans DATA_DIR du host (default
     # ./data). Pour multi-instance, set DATA_DIR=./data-NAME pour isoler.
@@ -59,10 +72,14 @@ services:
     # bouton Forcer dans l UI qui SIGKILL le worker).
     init: true
 
-    # Limite memoire raisonnable. Chromium + 2 publications en parallele
-    # consomment ~1.5-2 Go. 3 Go de cap protege contre un leak runaway.
-    # Ajuste si ton VPS a moins de RAM.
-    mem_limit: 3g
+    # Limite memoire ajustee a 5 Go apres observation de pics OOM autour de
+    # 3 Go lors du double upload (main + preview) de medias > 15 MB. Le
+    # composer Fansly declenche cote JS de multiples canvas.toBlob + video
+    # decoding qui pousse le renderer Chromium au-dessus de la baseline de
+    # 1.2-1.5 Go. Coussin de 5 Go absorbe ces pics sans OOM kill.
+    # Note : le VPS doit avoir >= 6-7 Go RAM pour supporter 2 bots + manager
+    # en pic simultane (rare car les cycles sont desynchronises).
+    mem_limit: 5g
 
     # Logs Docker : on garde les 10 derniers fichiers de 50 Mo pour eviter
     # de saturer le disque sur un VPS qui tourne des semaines.

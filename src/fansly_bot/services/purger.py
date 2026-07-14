@@ -269,6 +269,80 @@ class PurgerService:
                 "error": f"delete:{type(e).__name__}",
             }
 
+    async def purge_stored_ids(
+        self,
+        targets: list[tuple[str, str, str]],
+        *,
+        dry_run: bool,
+        max_deletions: int = 1000,
+        cancel_check=None,
+    ) -> dict:
+        """Purge FIABLE par IDs stockes : supprime chaque post via son
+        permalien (delete_post_by_fansly_id) plutot que par scroll du feed.
+
+        Pourquoi : la suppression inline en scrollant le feed profil est
+        fragile (apres chaque delete le DOM se reorganise, le scroll saute,
+        les items suivants deviennent introuvables -> delete_failed). La
+        suppression par permalien est eprouvee (utilisee par le CycleRotator
+        a chaque cycle) et deterministe. Applicable a tout post publie par le
+        bot, dont on a capture le fansly_post_id a la publication.
+
+        ``targets`` : liste de (fansly_post_id, media_filename, published_at).
+        Le garde-fou require_fyp=True protege contre la suppression d'un post
+        qui ne serait pas du bot (caption sans #fyp).
+
+        Retour : dict de comptage {deleted, not_found, guard_fyp, failed,
+        cancelled, would_delete (dry_run)}.
+        """
+        if cancel_check is not None:
+            self._cancel_check = cancel_check
+
+        counts = {
+            "deleted": 0, "not_found": 0, "guard_fyp": 0,
+            "failed": 0, "cancelled": 0, "would_delete": 0,
+        }
+        log.info(
+            "purger_stored_start",
+            targets=len(targets), dry_run=dry_run, max_deletions=max_deletions,
+        )
+
+        async with self._session.use():
+            await self._auth.ensure_logged_in()
+            page = await self._session.page()
+
+            for pid, media, pub_at in targets:
+                if self._cancel_check():
+                    log.info("purger_stored_cancelled", done=counts["deleted"])
+                    counts["cancelled"] += 1
+                    break
+                if counts["deleted"] >= max_deletions:
+                    log.info("purger_stored_max_deletions", cap=max_deletions)
+                    break
+
+                if dry_run:
+                    counts["would_delete"] += 1
+                    log.info(
+                        "purger_stored_dry_run",
+                        fansly_post_id=pid, media=media, published_at=pub_at[:19],
+                    )
+                    continue
+
+                res = await self.delete_post_by_fansly_id(
+                    pid, page=page, require_fyp=True
+                )
+                status = res.get("status", "failed")
+                counts[status] = counts.get(status, 0) + 1
+                log.info(
+                    "purger_stored_result",
+                    fansly_post_id=pid, media=media, status=status,
+                )
+                # Pause humaine entre suppressions destructrices
+                if status == "deleted":
+                    await self._humanizer.between_destructive_actions()
+
+        log.info("purger_stored_summary", **counts)
+        return counts
+
     # ---------- navigation profil ----------
 
     async def _goto_profile(self, page: Page) -> None:
@@ -441,8 +515,18 @@ class PurgerService:
                         max_deletions_hit = True
                         return examined, candidates, scroll_cap_hit, max_deletions_hit, deleted_inline
 
-            # Arret heuristiques
-            if consecutive_already_decided >= 15:
+            # Arret heuristique sur streak de posts deja-decides.
+            # C'est une optimisation pour les purges AGE-BASED (eviter de
+            # re-scanner un feed deja traite recemment). MAIS pour une purge
+            # par FENETRE DE DATES ciblant des posts anciens, les posts recents
+            # (hors fenetre, deja marques KEEP <12h) forment justement un long
+            # streak qu'il FAUT traverser pour atteindre la fenetre cible plus
+            # bas dans le feed. Sans cette exception, le purger s'arretait au
+            # bout de 15 posts recents deja-decides et n'atteignait JAMAIS les
+            # posts de la fenetre (ex: fenetre 1-2 juillet ignoree car le haut
+            # du feed 5-7 juillet etait deja decide). On desactive donc le break
+            # quand une fenetre de dates est active (borne par scroll_safety_cap).
+            if self._date_window is None and consecutive_already_decided >= 15:
                 log.info("purger_decided_streak", streak=consecutive_already_decided)
                 break
 
@@ -460,14 +544,41 @@ class PurgerService:
                 log.info("purger_cancelled_between_scrolls")
                 break
 
-            # Scroll humain
+            # Scroll robuste pour declencher l'infinite scroll de Fansly.
+            #
+            # Ancienne logique (scroll_human + short_pause + stagnant>=2 base
+            # sur scrollHeight) concluait "fin du feed" apres ~20 posts alors
+            # que Fansly n'avait juste pas eu le temps de charger la suite via
+            # XHR -> les posts anciens (fenetres de dates passees) n'etaient
+            # JAMAIS atteints (angle mort). Symptome observe : purge d'une
+            # fenetre 1-2 juillet trouvait 0 candidat car le purger s'arretait
+            # au 5 juillet.
+            #
+            # Nouvelle logique :
+            #  1. scroll_human d'abord (mouvement humain pour l'anti-detection)
+            #  2. PUIS un vrai scrollTo(bottom) pour atteindre la zone de
+            #     declenchement de l'infinite scroll a coup sur
+            #  3. attente ACTIVE du chargement (croissance du nombre d'items),
+            #     jusqu'a ~3s, plus fiable que scrollHeight seul
+            #  4. seuil de stagnation plus tolerant (4 au lieu de 2) : on ne
+            #     conclut "fin du feed" qu'apres 4 tentatives infructueuses
             await self._humanizer.scroll_human(page, direction="down")
-            await self._humanizer.short_pause()
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            loaded_more = False
+            for _ in range(6):  # jusqu'a ~3s d'attente du chargement XHR
+                await asyncio.sleep(0.5)
+                if await Sel.feed_items(page).count() > count:
+                    loaded_more = True
+                    break
             new_height = await page.evaluate("document.body.scrollHeight")
-            if new_height == last_height:
+            if not loaded_more and new_height == last_height:
                 stagnant_scrolls += 1
-                if stagnant_scrolls >= 2:
-                    log.info("purger_feed_bottom_reached")
+                if stagnant_scrolls >= 4:
+                    log.info(
+                        "purger_feed_bottom_reached",
+                        examined=examined,
+                        seen_unique=len(seen_ids),
+                    )
                     break
             else:
                 stagnant_scrolls = 0

@@ -18,10 +18,14 @@ WORKDIR /app
 
 # Dependances : streamlit pour l'UI, docker-py pour piloter les containers
 # voisins via /var/run/docker.sock.
+# Versions PINNEES (==) : un rebuild ne doit PAS tirer une nouvelle version
+# de Streamlit a l'improviste. Sinon les assets JS changent de hash et le
+# navigateur (cache) affiche une page blanche en boucle apres chaque rebuild.
+# Pour monter de version : changer le pin ici volontairement + hard refresh.
 RUN pip install --upgrade pip && \
     pip install \
-        "streamlit>=1.40.0" \
-        "docker>=7.0.0"
+        "streamlit==1.59.0" \
+        "docker==7.1.0"
 
 # Copie le code du manager (les autres modules ne sont PAS necessaires)
 COPY src/fansly_manager /app/src/fansly_manager

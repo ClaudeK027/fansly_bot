@@ -621,6 +621,11 @@ def start_bot_instance(cfg: WizardConfig) -> Result[dict]:
                 error="Repo non accessible depuis le manager (bind mount manquant).",
             )
         env_vars = _parse_env_file(repo_in / f".env.{cfg.instance_name}")
+        # Tuning glibc malloc (mitigation memoire, cf docker-compose.yml) :
+        # borne les arenes + abaisse le seuil d auto-trim pour que glibc rende
+        # la memoire a l OS plus tot. Mitigation partielle du ratchet Streamlit.
+        env_vars.setdefault("MALLOC_ARENA_MAX", "2")
+        env_vars.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
         data_dir = repo / f"data-{cfg.instance_name}"
         config_yaml = repo / "config.yaml"
 
@@ -651,7 +656,7 @@ def start_bot_instance(cfg: WizardConfig) -> Result[dict]:
                 str(config_yaml): {"bind": "/app/config.yaml", "mode": "ro"},
             },
             shm_size="1g",
-            mem_limit="3g",
+            mem_limit="5g",
             init=True,
         )
         return Result(ok=True, value={"container_id": container.id, "host_port": port})

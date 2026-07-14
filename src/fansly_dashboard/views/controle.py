@@ -519,7 +519,12 @@ elif _active_tab == "Purge":
 # ============== Queue ==============
 elif _active_tab == "Queue":
 
-    @st.fragment(run_every="5s")
+    # run_every=30s (et non 5s) : chaque tick declenche un rerun serveur
+    # complet du fragment qui alloue une nuee de petits objets protobuf/Delta
+    # non rendus a l'OS par glibc. A 5s = ~17k rerun/jour/onglet ouvert = moteur
+    # principal du ratchet memoire qui menait a l'OOM. 30s divise le churn par 6.
+    # Le bouton "Rafraichir" ci-dessous permet un refresh manuel immediat.
+    @st.fragment(run_every="30s")
     def _queue_panel() -> None:
         state_local = get_state()
         c_refresh, _ = st.columns([1, 5])
